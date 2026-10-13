@@ -1,0 +1,527 @@
+"""Base SKU Demand Planner - local app.  Start with:  streamlit run app.py"""
+from __future__ import annotations
+
+import datetime as dt
+
+import altair as alt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from planner import dataio, db, sample
+from planner.engine import ALL, DEFAULTS, run_forecast
+
+st.set_page_config(page_title="Base SKU Demand Planner", layout="wide", initial_sidebar_state="expanded")
+
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+STATUS_COLORS = {"Discontinued": "#9aa3a0", "Active": "#2a78d6", "Phasing out": "#eda100", "New": "#1baf7a"}
+SPLIT_LABELS = {"recent": "Recent shipment mix", "equal": "Equal split", "manual": "Manual percentages"}
+MONTH_RE = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+def label(m: str) -> str:
+    return dt.date(int(m[:4]), int(m[5:7]), 1).strftime("%b %y")
+
+
+def fmt(n) -> str:
+    return f"{n:,.0f}"
+
+
+# ------------------------------------------------------------------ data access
+@st.cache_data(show_spinner=False)
+def load_inputs(version: int) -> dict[str, pd.DataFrame]:
+    return {t: db.read(t) for t in db.SCHEMA}
+
+
+@st.cache_data(show_spinner=False)
+def load_result(when: str | None):
+    return db.load_result()
+
+
+@st.cache_data(show_spinner=False)
+def excel_export(when: str) -> bytes:
+    res, _ = db.load_result()
+    return dataio.export_excel(res, db.read("items"))
+
+
+def inputs() -> dict[str, pd.DataFrame]:
+    return load_inputs(db.get_setting("inputs_version", 0) or 0)
+
+
+def result():
+    info = db.get_setting("run_info")
+    return load_result(info["when"] if info else None)
+
+
+def do_run() -> bool:
+    d = inputs()
+    if d["shipments"].empty or d["items"].empty:
+        st.error("Load an item master and shipments first (Data page).")
+        return False
+    cfg = db.get_config()
+    bar = st.progress(0.0, text="Forecasting...")
+    try:
+        res = run_forecast(d["items"], d["customers"], d["locations"], d["shipments"], d["version_transitions"],
+                           d["hard_transitions"], d["new_products"], d["split_settings"], d["manual_split"], cfg,
+                           progress=lambda p: bar.progress(min(1.0, p), text="Forecasting..."))
+    except ValueError as e:
+        bar.empty()
+        st.error(str(e))
+        return False
+    db.save_result(res, cfg, dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    bar.empty()
+    return True
+
+
+def load_sample():
+    db.reset()
+    for table, df in sample.build().items():
+        db.write(table, df)
+    st.cache_data.clear()
+    do_run()
+
+
+def save(table: str, df: pd.DataFrame, msg: str = "Saved. Run the forecast to apply the change."):
+    db.write(table, df)
+    st.session_state["flash"] = msg
+    st.rerun()
+
+
+# ------------------------------------------------------------------ sidebar
+with st.sidebar:
+    st.title("Base SKU Demand Planner")
+    page = st.radio("Go to", ["Forecast", "Lifecycle", "Master data", "Accuracy", "Data"], label_visibility="collapsed")
+    st.divider()
+    info = db.get_setting("run_info")
+    if st.button("Run forecast", type="primary", width="stretch"):
+        if do_run():
+            st.rerun()
+    if info:
+        st.caption(f"Last run {info['when']}")
+        if db.is_stale():
+            st.warning("Inputs changed since the last run.")
+    else:
+        st.caption("No forecast has been run yet.")
+    with st.expander("Settings"):
+        cfg = db.get_config()
+        with st.form("settings"):
+            horizon = st.number_input("Forecast horizon, months", 3, 36, int(cfg["horizon"]))
+            seasonal = st.checkbox("Use seasonal models", bool(cfg["seasonal"]))
+            holdout = st.number_input("Backtest holdout, months", 3, 12, int(cfg["holdout"]))
+            recent = st.number_input("Recent-mix window, months", 1, 24, int(cfg["recent_window"]))
+            npi_m = st.number_input("New item borrows until it has this many months of its own history", 1, 24,
+                                    int(cfg["npi_own_history_months"]))
+            by_ch = st.checkbox("Pool non-key customers by channel", bool(cfg["nonkey_by_channel"]))
+            drop = st.checkbox("Ignore the latest month (incomplete)", bool(cfg["drop_last_month"]))
+            if st.form_submit_button("Save settings"):
+                db.set_config({**cfg, "horizon": int(horizon), "seasonal": seasonal, "holdout": int(holdout),
+                               "recent_window": int(recent), "npi_own_history_months": int(npi_m),
+                               "nonkey_by_channel": by_ch, "drop_last_month": drop})
+                st.rerun()
+
+if "flash" in st.session_state:
+    st.success(st.session_state.pop("flash"))
+
+D = inputs()
+res, info = result()
+
+if D["items"].empty and page != "Data":
+    st.header("Start by loading data")
+    st.write("The database is empty. Load the sample data to see how the planner works, "
+             "or go to the Data page to load your own item, customer, location and shipment files.")
+    if st.button("Load sample data", type="primary"):
+        load_sample()
+        st.rerun()
+    st.stop()
+
+if res is None and page in ("Forecast", "Lifecycle", "Accuracy"):
+    st.header(page)
+    st.info("No forecast yet. Press Run forecast in the sidebar.")
+    st.stop()
+
+
+def base_names() -> dict[str, str]:
+    it = D["items"]
+    name = it["base_description"].fillna("").where(it["base_description"].fillna("") != "", it["description"].fillna(""))
+    return dict(zip(it["base_sku"], name))
+
+
+# ------------------------------------------------------------------ Forecast
+if page == "Forecast":
+    names = base_names()
+    bases = sorted(b for b in names if b)
+    groups = sorted(set(res.base_fc["customer_group"]) | set(res.hist["customer_group"]),
+                    key=lambda g: (g.startswith("All other"), g))
+    locs = sorted(D["locations"]["location"])
+
+    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    base = c1.selectbox("Base SKU", bases, format_func=lambda b: f"{b} · {names[b]}")
+    group = c2.selectbox("Customer group", [ALL] + groups, format_func=lambda g: "All customers" if g == ALL else g)
+    loc = c3.selectbox("Ship-from", [ALL] + locs, format_func=lambda l: "All locations" if l == ALL else l)
+    ss = D["split_settings"]
+    cur = dict(zip(ss["base_sku"], ss["method"])).get(base, "recent")
+    method = c4.selectbox(f"Version split for {base}", list(SPLIT_LABELS), index=list(SPLIT_LABELS).index(cur),
+                          format_func=SPLIT_LABELS.get)
+    if method != cur:
+        save("split_settings", pd.concat([ss[ss["base_sku"] != base],
+                                          pd.DataFrame([[base, method]], columns=["base_sku", "method"])]))
+
+    base_versions = D["items"][D["items"]["base_sku"] == base].sort_values("version_seq")
+    if method == "manual":
+        ms = D["manual_split"]
+        mine = dict(zip(ms.loc[ms["base_sku"] == base, "version_sku"], ms.loc[ms["base_sku"] == base, "pct"]))
+        fv = base_versions[base_versions["forecastable"]]
+        ed = st.data_editor(
+            pd.DataFrame({"version_sku": fv["version_sku"].values,
+                          "pct": [float(mine.get(v, round(100 / max(len(fv), 1)))) for v in fv["version_sku"]]}),
+            hide_index=True, disabled=["version_sku"], key=f"manual_{base}",
+            column_config={"version_sku": "Version", "pct": st.column_config.NumberColumn(
+                "Share of base SKU forecast, %", min_value=0, max_value=100, step=5)})
+        st.caption("Shares are rescaled across the versions eligible in each month.")
+        if st.button("Save percentages"):
+            save("manual_split", pd.concat([ms[ms["base_sku"] != base], ed.assign(base_sku=base)]))
+
+    ch = res.chains.set_index("base_sku")
+    if base not in ch.index:
+        st.info("This base SKU was added after the last run. Run the forecast to include it.")
+        st.stop()
+    root, source = ch.loc[base, "root_base"], ch.loc[base, "source"]
+    chain = [base] if source != "own" else [b for b in ch.index if ch.loc[b, "root_base"] == root and ch.loc[b, "source"] == "own"]
+    order = D["items"][D["items"]["base_sku"].isin(chain)].copy()
+    order["rank"] = order["base_sku"].map({b: (0 if b != root else 1) for b in chain})
+    versions = list(order.sort_values(["rank", "base_sku", "version_seq"])["version_sku"])
+
+    def pick(df, base_col="base_sku", in_bases=chain):
+        df = df[df[base_col].isin(in_bases)]
+        if group != ALL:
+            df = df[df["customer_group"] == group]
+        if loc != ALL:
+            df = df[df["location"] == loc]
+        return df
+
+    hist, vfc, bfc, un = pick(res.hist), pick(res.version_fc), pick(res.base_fc), pick(res.unallocated)
+    ser = pick(res.series, "root_base", [root])
+    months = res.hist_months + res.fc_months
+
+    # ---- headline figures
+    n12 = bfc[bfc["month"].isin(res.fc_months[:12])]["qty"].sum()
+    l12 = hist[hist["month"].isin(res.hist_months[-12:])]["qty"].sum()
+    act = ser["act"].sum()
+    borrowed = f" (from {root})" if root != base else ""
+    def stat(col, title, value, sub=""):
+        col.caption(title)
+        col.markdown(f"#### {value}")
+        if sub:
+            col.caption(sub)
+
+    k1, k2, k3, k4 = st.columns(4)
+    stat(k1, "Forecast, next 12 months", fmt(n12) + " units",
+         f"{(n12 / l12 - 1) * 100:+.0f}% vs last 12 months shipped ({fmt(l12)})" if l12 else "New item, no shipments yet")
+    stat(k2, "Backtest error" + borrowed, f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
+         f"bias {ser['err'].sum() / act * 100:+.0f}% (positive = over-forecast)" if act else "Not enough history to backtest")
+    if len(ser):
+        top = ser["model"].value_counts()
+        stat(k3, "Model" + borrowed, top.index[0], f"chosen for {top.iloc[0]} of {len(ser)} series")
+    src_hist = pick(res.hist, in_bases=[b for b in ch.index if ch.loc[b, "root_base"] == root and ch.loc[b, "source"] == "own"])
+    if len(src_hist):
+        mm = src_hist["month"].str[5:7]
+        cal = src_hist.groupby(mm)["qty"].sum() / src_hist.groupby(mm)["month"].nunique()
+        stat(k4, "Seasonal peak" + borrowed, dt.date(2000, int(cal.idxmax()), 1).strftime("%B"),
+             f"{cal.max() / cal.mean():.2f}x an average month")
+
+    # ---- chart: history and forecast stacked by version
+    plot = pd.concat([hist.groupby(["version_sku", "month"], as_index=False)["qty"].sum().assign(kind="Shipped"),
+                      vfc.groupby(["version_sku", "month"], as_index=False)["qty"].sum().assign(kind="Forecast"),
+                      un.groupby("month", as_index=False)["qty"].sum().assign(kind="Forecast", version_sku="Unallocated")])
+    plot["label"] = plot["month"].map(label)
+    plot["order"] = plot["version_sku"].map({v: i for i, v in enumerate(versions + ["Unallocated"])})
+    shown = [v for v in versions if v in set(plot["version_sku"])] + (["Unallocated"] if len(un) else [])
+    colors = [SERIES[versions.index(v) % len(SERIES)] if v in versions else "#9aa3a0" for v in shown]
+    lab = "timeFormat(datetime(parseInt(slice(datum.value,0,4)), parseInt(slice(datum.value,5,7))-1, 1), '%b %y')"
+    x = alt.X("month:N", sort=months, title=None, scale=alt.Scale(domain=months),
+              axis=alt.Axis(values=[m for m in months if m[5:7] in ("01", "04", "07", "10")], labelAngle=0, labelExpr=lab))
+    band = alt.Chart(pd.DataFrame({"month": [res.fc_months[0]], "month2": [res.fc_months[-1]]})).mark_rect(
+        opacity=0.10, color="#2a78d6").encode(x=x, x2="month2:N")
+    bars = alt.Chart(plot).mark_bar(cornerRadiusTopLeft=1, cornerRadiusTopRight=1).encode(
+        x=x, y=alt.Y("qty:Q", title="Units per month", stack="zero"),
+        color=alt.Color("version_sku:N", title="Version", scale=alt.Scale(domain=shown, range=colors),
+                        legend=alt.Legend(orient="top")),
+        opacity=alt.Opacity("kind:N", title=None, scale=alt.Scale(domain=["Shipped", "Forecast"], range=[1.0, 0.6]),
+                            legend=alt.Legend(orient="top")),
+        order="order:Q",
+        tooltip=[alt.Tooltip("label:N", title="Month"), alt.Tooltip("kind:N", title="Type"),
+                 alt.Tooltip("version_sku:N", title="Version"), alt.Tooltip("qty:Q", title="Units", format=",.0f")])
+    st.subheader("  →  ".join(f"{b} {names[b]}" for b in sorted(chain, key=lambda b: b == root)))
+    st.caption("Monthly units by version. The shaded months are forecast.")
+    st.altair_chart((band + bars).properties(height=340), width="stretch")
+
+    # ---- lifecycle rules that apply to this chain
+    notes = []
+    it = D["items"]
+    for b in chain:
+        dead = it[(it["base_sku"] == b) & ~it["forecastable"] & it["version_sku"].isin(hist["version_sku"])]
+        if len(dead):
+            notes.append(f"{', '.join(dead['version_sku'])}: not forecastable. History counts toward {b}; no forecast is allocated.")
+    for r in D["version_transitions"].itertuples():
+        if r.from_version in versions:
+            who = "all other customer groups move" if r.customer_group == ALL else f"{r.customer_group} moves"
+            notes.append(f"Staggered transition: {who} from {r.from_version} to {r.to_version} in {label(r.effective_month)}.")
+    for r in D["hard_transitions"].itertuples():
+        if r.from_base in chain:
+            notes.append(f"Hard transition: every version of {r.from_base} stops in {label(r.effective_month)}. "
+                         f"{r.to_base} takes over using {r.from_base} history x {r.scale:g}.")
+    for r in D["new_products"].itertuples():
+        if r.base_sku == base:
+            notes.append(f"New product: launches {label(r.launch_month)}. Borrows the {r.like_base} forecast x {r.scale:g}"
+                         + (f", ramping {r.ramp} then 1." if r.ramp else ".") if source != "own"
+                         else f"New product rule no longer applies: {base} has enough history of its own.")
+    if len(un):
+        notes.append(":red[Some forecast has no eligible version and is held at base SKU level as Unallocated.]")
+    if notes:
+        st.markdown("**Lifecycle rules in effect**\n" + "\n".join(f"- {n}" for n in notes))
+
+    # ---- grid
+    st.subheader("Forecast grid")
+    rows = []
+
+    def line(name, df):
+        s = df.groupby("month")["qty"].sum().reindex(res.fc_months, fill_value=0)
+        return {"Item": name, **{label(m): int(v) for m, v in s.items()}, "Total": int(s.sum())}
+
+    for b in sorted(chain, key=lambda b: b == root):
+        bb, vv, uu = bfc[bfc["base_sku"] == b], vfc[vfc["base_sku"] == b], un[un["base_sku"] == b]
+        rows.append(line(f"{b} base SKU forecast", bb))
+        for v in [v for v in versions if v in set(it.loc[it["base_sku"] == b, "version_sku"])]:
+            rows.append(line(f"    {v}", vv[vv["version_sku"] == v]))
+        if len(uu):
+            rows.append(line("    Unallocated", uu))
+        diff = line("    Check: base minus versions", bb)
+        alloc = line("", pd.concat([vv, uu]))
+        rows.append({k: (v if k == "Item" else v - alloc[k]) for k, v in diff.items()})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                 column_config={"Item": st.column_config.TextColumn(pinned=True),
+                                **{label(m): st.column_config.NumberColumn(format="localized") for m in res.fc_months},
+                                "Total": st.column_config.NumberColumn(format="localized")})
+
+    e1, e2, _ = st.columns([3, 3, 3])
+    e1.download_button("Download all forecasts (Excel)", excel_export(info["when"]),
+                       file_name=f"forecast_{info['when'][:10]}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    e2.download_button("Download version forecast (CSV)", res.version_fc.to_csv(index=False).encode(),
+                       file_name=f"version_forecast_{info['when'][:10]}.csv", mime="text/csv")
+
+# ------------------------------------------------------------------ Lifecycle
+elif page == "Lifecycle":
+    st.header("Lifecycle")
+    names = base_names()
+    it = D["items"]
+    ruled = set(D["hard_transitions"]["from_base"]) | set(D["hard_transitions"]["to_base"]) | set(D["new_products"]["base_sku"])
+    ruled |= set(it.loc[it["version_sku"].isin(D["version_transitions"]["from_version"]), "base_sku"])
+    all_bases = sorted(b for b in names if b)
+    default = sorted(ruled & set(all_bases)) or all_bases[:5]
+    pick_b = st.multiselect("Base SKUs on the calendar", all_bases, default, format_func=lambda b: f"{b} · {names[b]}")
+
+    months = res.hist_months + res.fc_months
+    act = pd.concat([res.hist[["version_sku", "month"]].assign(kind="h"), res.version_fc[["version_sku", "month"]].assign(kind="f")])
+    act = act[act["version_sku"].isin(it.loc[it["base_sku"].isin(pick_b), "version_sku"])]
+    if act.empty:
+        st.info("Nothing to show for this selection.")
+    else:
+        g = act.groupby("version_sku")
+        span = pd.DataFrame({"start": g["month"].min(), "end": g["month"].max(),
+                             "has_h": g["kind"].apply(lambda s: (s == "h").any()),
+                             "has_f": g["kind"].apply(lambda s: (s == "f").any())}).reset_index()
+        last = res.fc_months[-1]
+        span["status"] = np.select([~span["has_f"], ~span["has_h"], span["end"] < last],
+                                   ["Discontinued", "New", "Phasing out"], "Active")
+        nxt = lambda m: (pd.Period(m, "M") + 1).to_timestamp()  # noqa: E731
+        span["from"] = pd.to_datetime(span["start"])
+        span["to"] = span["end"].map(nxt)
+        span = span.merge(it[["version_sku", "base_sku", "version_seq"]], on="version_sku").sort_values(["base_sku", "version_seq"])
+        bars = alt.Chart(span).mark_bar(height=12, cornerRadius=2).encode(
+            x=alt.X("from:T", title=None, axis=alt.Axis(format="%b %y"), scale=alt.Scale(domain=[pd.to_datetime(months[0]), nxt(months[-1])])), x2="to:T",
+            y=alt.Y("version_sku:N", sort=list(span["version_sku"]), title=None),
+            color=alt.Color("status:N", title="Status", legend=alt.Legend(orient="top"),
+                            scale=alt.Scale(domain=list(STATUS_COLORS), range=list(STATUS_COLORS.values()))),
+            tooltip=[alt.Tooltip("version_sku:N", title="Version"), alt.Tooltip("status:N", title="Status"),
+                     alt.Tooltip("start:N", title="First month"), alt.Tooltip("end:N", title="Last month")])
+        today = alt.Chart(pd.DataFrame({"t": [pd.to_datetime(res.fc_months[0])]})).mark_rule(strokeDash=[4, 3]).encode(x="t:T")
+        st.caption("Each bar runs from a version's first shipment to its last forecast month. The dashed line is the first forecast month.")
+        st.altair_chart((bars + today).properties(height=alt.Step(26)), width="stretch")
+
+    month_col = lambda t: st.column_config.TextColumn(t, validate=MONTH_RE, help="YYYY-MM", required=True)  # noqa: E731
+    st.subheader("Version transitions")
+    st.caption("One version replaces another inside a base SKU. Use a customer group name to move that customer first, "
+               "and ALL for everyone else. This is how a staggered transition is set up.")
+    vt = st.data_editor(D["version_transitions"], num_rows="dynamic", hide_index=True, key="vt", width="stretch",
+                        column_config={"from_version": st.column_config.TextColumn("From version", required=True),
+                                       "to_version": st.column_config.TextColumn("To version", required=True),
+                                       "customer_group": st.column_config.TextColumn("Customer group or ALL", default=ALL, required=True),
+                                       "effective_month": month_col("Effective month")})
+    st.subheader("Hard transitions")
+    st.caption("A whole base SKU is discontinued and replaced. The successor is forecast on the combined history.")
+    ht = st.data_editor(D["hard_transitions"], num_rows="dynamic", hide_index=True, key="ht", width="stretch",
+                        column_config={"from_base": st.column_config.TextColumn("From base SKU", required=True),
+                                       "to_base": st.column_config.TextColumn("To base SKU", required=True),
+                                       "effective_month": month_col("Effective month"),
+                                       "scale": st.column_config.NumberColumn("Volume factor", default=1.0, min_value=0.0, step=0.05)})
+    st.subheader("New products")
+    st.caption("A new base SKU borrows the forecast of a like item, times a factor, with an optional ramp for the first months "
+               "(for example 0.3,0.6,0.85).")
+    npd = st.data_editor(D["new_products"], num_rows="dynamic", hide_index=True, key="npd", width="stretch",
+                         column_config={"base_sku": st.column_config.TextColumn("New base SKU", required=True),
+                                        "like_base": st.column_config.TextColumn("Like item (base SKU)", required=True),
+                                        "launch_month": month_col("Launch month"),
+                                        "scale": st.column_config.NumberColumn("Volume factor", default=1.0, min_value=0.0, step=0.05),
+                                        "ramp": st.column_config.TextColumn("Ramp")})
+    if st.button("Save rules", type="primary"):
+        db.write("version_transitions", vt.dropna(subset=["from_version", "to_version", "effective_month"]))
+        db.write("hard_transitions", ht.dropna(subset=["from_base", "to_base", "effective_month"]))
+        save("new_products", npd.dropna(subset=["base_sku", "like_base", "launch_month"]))
+
+# ------------------------------------------------------------------ Master data
+elif page == "Master data":
+    st.header("Master data")
+    t1, t2, t3 = st.tabs([f"Items ({len(D['items']):,})", f"Customers ({len(D['customers']):,})",
+                          f"Locations ({len(D['locations']):,})"])
+    opt_month = lambda t: st.column_config.TextColumn(t, validate=MONTH_RE, help="YYYY-MM, or leave blank")  # noqa: E731
+    with t1:
+        st.caption("Every version rolls up to its base SKU. Untick Forecastable to stop a version receiving forecast; "
+                   "its history still counts toward the base SKU.")
+        ed = st.data_editor(D["items"], num_rows="dynamic", hide_index=True, key="items", width="stretch",
+                            column_config={"version_sku": st.column_config.TextColumn("Version SKU", required=True),
+                                           "description": "Description", "base_sku": "Base SKU",
+                                           "base_description": "Base description",
+                                           "version_seq": st.column_config.NumberColumn("Seq", step=1),
+                                           "family": "Family",
+                                           "forecastable": st.column_config.CheckboxColumn("Forecastable", default=True),
+                                           "launch_month": opt_month("Launch month"),
+                                           "discontinue_month": opt_month("Discontinue month")})
+        if st.button("Save items", type="primary"):
+            if ed["version_sku"].duplicated().any():
+                st.error("Version SKU must be unique.")
+            else:
+                save("items", ed)
+    with t2:
+        st.caption("Key customers are forecast on their own. Everyone else is forecast together as All other. "
+                   "Give two key accounts the same customer group to plan them as one.")
+        ed = st.data_editor(D["customers"], num_rows="dynamic", hide_index=True, key="customers", width="stretch",
+                            column_config={"account": st.column_config.TextColumn("Account", required=True),
+                                           "name": "Customer", "channel": "Channel",
+                                           "key_customer": st.column_config.CheckboxColumn("Key customer", default=False),
+                                           "customer_group": "Customer group (optional)"})
+        if st.button("Save customers", type="primary"):
+            if ed["account"].duplicated().any():
+                st.error("Account must be unique.")
+            else:
+                save("customers", ed)
+    with t3:
+        ed = st.data_editor(D["locations"], num_rows="dynamic", hide_index=True, key="locations", width="stretch",
+                            column_config={"location": st.column_config.TextColumn("Location", required=True),
+                                           "name": "Name", "type": "Type", "region": "Region"})
+        if st.button("Save locations", type="primary"):
+            save("locations", ed)
+
+# ------------------------------------------------------------------ Accuracy
+elif page == "Accuracy":
+    st.header("Backtest accuracy")
+    s = res.series[res.series["act"] > 0]
+    holdout = int(info["config"].get("holdout", DEFAULTS["holdout"]))
+    st.caption(f"Each series was fitted without its last {holdout} months, then scored against them. "
+               "WAPE is total absolute error over total shipments. Hard-transition chains are listed under the successor base SKU.")
+    if s.empty:
+        st.info("No series has enough history to backtest.")
+    else:
+        def pct_table(col):
+            g = s.groupby(["root_base", "customer_group"])[[col, "act"]].sum()
+            p = (g[col] / g["act"] * 100).unstack("customer_group")
+            tot = s.groupby("root_base")[[col, "act"]].sum()
+            p["All customers"] = tot[col] / tot["act"] * 100
+            p.index.name = "Base SKU"
+            return p
+
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Overall WAPE", f"{s['abs_err'].sum() / s['act'].sum() * 100:.1f}%")
+        a2.metric("Overall bias", f"{s['err'].sum() / s['act'].sum() * 100:+.1f}%", help="Positive means over-forecast")
+        a3.metric("Series backtested", fmt(len(s)))
+        st.subheader("WAPE by base SKU and customer group, %")
+        st.dataframe(pct_table("abs_err").style.format("{:.0f}", na_rep=""), width="stretch")
+        st.subheader("Bias by base SKU and customer group, %")
+        st.dataframe(pct_table("err").style.format("{:+.0f}", na_rep=""), width="stretch")
+        st.subheader("Models chosen")
+        mc = res.series["model"].value_counts().rename_axis("Model").reset_index(name="Series")
+        st.dataframe(mc, hide_index=True)
+
+# ------------------------------------------------------------------ Data
+elif page == "Data":
+    st.header("Data")
+    c = st.columns(4)
+    for col, (t, name) in zip(c, [("items", "Items"), ("customers", "Customers"), ("locations", "Locations"),
+                                  ("shipments", "Shipment rows (monthly)")]):
+        col.metric(name, fmt(db.count(t)))
+    if not D["shipments"].empty:
+        st.caption(f"Shipment history runs {label(D['shipments']['month'].min())} to {label(D['shipments']['month'].max())}.")
+
+    st.subheader("Load your files")
+    st.write("CSV or Excel, one file per table, first row as headers. Load the three masters first, then shipments. "
+             "Daily shipment lines are summed to months.")
+    specs = [("items", "Item master", "version_sku, base_sku required. Optional: description, base_description, version_seq, "
+                                      "family, forecastable (Y/N), status, launch_date, discontinue_date."),
+             ("customers", "Customer master", "account required. Optional: name, channel, key_customer (Y/N), customer_group."),
+             ("locations", "Location master", "location required. Optional: name, type, region."),
+             ("shipments", "Shipments", "ship_date, version_sku, account, location, quantity.")]
+    for tab, (table, title, cols) in zip(st.tabs([s[1] for s in specs]), specs):
+        with tab:
+            st.caption("Columns: " + cols)
+            st.download_button("Download template", dataio.template_csv(table), file_name=f"{table}_template.csv",
+                               mime="text/csv", key=f"tpl_{table}")
+            mode = "Replace everything"
+            if table == "shipments":
+                mode = st.radio("How to load", ["Replace the months in the file, keep the rest", "Replace everything"],
+                                key="ship_mode")
+            up = st.file_uploader(f"{title} file", type=["csv", "xlsx", "xls", "txt"], key=f"up_{table}")
+            if up is not None:
+                try:
+                    clean, issues = dataio.normalize(table, dataio.read_upload(up))
+                except Exception as e:  # show the reason, load nothing
+                    st.error(f"Could not read this file. {e}")
+                else:
+                    st.write(f"{len(clean):,} rows ready to load.")
+                    for i in issues:
+                        st.warning(i)
+                    st.dataframe(clean.head(20), hide_index=True, width="stretch")
+                    if st.button(f"Load {title.lower()}", type="primary", key=f"load_{table}"):
+                        if table == "shipments" and mode != "Replace everything":
+                            db.upsert_shipments(clean)
+                        else:
+                            db.write(table, clean)
+                        st.session_state["flash"] = f"{title} loaded: {len(clean):,} rows. Run the forecast to use it."
+                        st.rerun()
+
+    if res is not None and len(res.exceptions):
+        st.subheader("Exceptions from the last run")
+        st.caption("Shipments that did not match master data were left out of history. Fix the master data and run again.")
+        st.dataframe(res.exceptions.rename(columns=str.capitalize), hide_index=True, width="stretch")
+
+    log = db.get_setting("run_log", [])
+    if log:
+        with st.expander("Run history"):
+            st.dataframe(pd.DataFrame([{"When": r["when"], "Series": r["series"], "Forecast units": round(r["forecast_units"]),
+                                        "Horizon": r["config"]["horizon"], "Seasonal": r["config"]["seasonal"]}
+                                       for r in reversed(log)]), hide_index=True)
+
+    st.subheader("Sample data and reset")
+    s1, s2 = st.columns(2)
+    with s1:
+        st.write("Replace everything with the sample range (6 base SKUs, 8 customers, 3 locations, 36 months).")
+        sure = st.checkbox("Yes, replace what is loaded", key="sure_sample", value=D["items"].empty)
+        if st.button("Load sample data", disabled=not sure):
+            load_sample()
+            st.rerun()
+    with s2:
+        st.write("Delete all data, rules, settings and results.")
+        sure2 = st.checkbox("Yes, delete everything", key="sure_reset")
+        if st.button("Clear the database", disabled=not sure2):
+            db.reset()
+            st.cache_data.clear()
+            st.rerun()

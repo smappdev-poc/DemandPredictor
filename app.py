@@ -2,14 +2,21 @@
 from __future__ import annotations
 
 import datetime as dt
+import time
 
 import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from planner import dataio, db, sample
-from planner.engine import ALL, DEFAULTS, run_forecast
+import importlib
+
+from planner import dataio, db, engine, explore, sample
+
+# Pick up edits to the planner package without restarting the app.
+for _m in (engine, db, dataio, explore, sample):
+    importlib.reload(_m)
+from planner.engine import ALL, DEFAULTS, run_forecast  # noqa: E402
 
 st.set_page_config(page_title="Base SKU Demand Planner", layout="wide", initial_sidebar_state="expanded")
 
@@ -59,6 +66,7 @@ def do_run() -> bool:
         st.error("Load an item master and shipments first (Data page).")
         return False
     cfg = db.get_config()
+    t_start = time.time()
     bar = st.progress(0.0, text="Forecasting...")
     try:
         res = run_forecast(d["items"], d["customers"], d["locations"], d["shipments"], d["version_transitions"],
@@ -69,6 +77,8 @@ def do_run() -> bool:
         st.error(str(e))
         return False
     db.save_result(res, cfg, dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    db.set_setting("last_run_seconds", round(time.time() - t_start, 1))
+    db.set_setting("last_run_workers", engine.LAST_RUN["workers"])
     bar.empty()
     return True
 
@@ -90,14 +100,16 @@ def save(table: str, df: pd.DataFrame, msg: str = "Saved. Run the forecast to ap
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.title("Base SKU Demand Planner")
-    page = st.radio("Go to", ["Forecast", "Lifecycle", "Master data", "Accuracy", "Data"], label_visibility="collapsed")
+    page = st.radio("Go to", ["Forecast", "Explore", "Lifecycle", "Master data", "Accuracy", "Data"], label_visibility="collapsed")
     st.divider()
     info = db.get_setting("run_info")
     if st.button("Run forecast", type="primary", width="stretch"):
         if do_run():
             st.rerun()
     if info:
-        st.caption(f"Last run {info['when']}")
+        secs = db.get_setting("last_run_seconds")
+        st.caption(f"Last run {info['when']}" + (f" · took {secs:g} s" if secs is not None else "")
+                   + (f" on {db.get_setting('last_run_workers')} processes" if (db.get_setting("last_run_workers") or 1) > 1 else ""))
         if db.is_stale():
             st.warning("Inputs changed since the last run.")
     else:
@@ -107,6 +119,13 @@ with st.sidebar:
         with st.form("settings"):
             horizon = st.number_input("Forecast horizon, months", 3, 36, int(cfg["horizon"]))
             seasonal = st.checkbox("Use seasonal models", bool(cfg["seasonal"]))
+            arima_on = st.checkbox("Use ARIMA and SARIMA models", bool(cfg["arima"]),
+                                   help="Adds ARIMA and SARIMA to the models each series tries. About 1 second "
+                                        "more per series; turn off for very large runs.",
+                                   disabled=not engine.HAS_STATSMODELS)
+            workers = st.number_input("Worker processes for ARIMA (0 = automatic)", 0, 64, int(cfg.get("workers", 0)),
+                                      help=f"Automatic uses {engine.worker_count({'workers': 0})} on this computer. "
+                                           f"Used when there are {engine.PARALLEL_MIN_SERIES}+ series.")
             holdout = st.number_input("Backtest holdout, months", 3, 12, int(cfg["holdout"]))
             recent = st.number_input("Recent-mix window, months", 1, 24, int(cfg["recent_window"]))
             npi_m = st.number_input("New item borrows until it has this many months of its own history", 1, 24,
@@ -115,9 +134,19 @@ with st.sidebar:
             drop = st.checkbox("Ignore the latest month (incomplete)", bool(cfg["drop_last_month"]))
             if st.form_submit_button("Save settings"):
                 db.set_config({**cfg, "horizon": int(horizon), "seasonal": seasonal, "holdout": int(holdout),
-                               "recent_window": int(recent), "npi_own_history_months": int(npi_m),
+                               "recent_window": int(recent), "arima": bool(arima_on), "workers": int(workers), "npi_own_history_months": int(npi_m),
                                "nonkey_by_channel": by_ch, "drop_last_month": drop})
                 st.rerun()
+
+# ------------------------------------------------------------------ banner (every page)
+st.markdown(
+    """
+    <div style="background:#0b6e5f;color:#ffffff;border-radius:8px;padding:14px 20px;margin-bottom:12px;">
+      <div style="font-size:1.35rem;font-weight:600;line-height:1.3;">Welcome to Demand Predictor</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 if "flash" in st.session_state:
     st.success(st.session_state.pop("flash"))
@@ -310,6 +339,247 @@ if page == "Forecast":
     e2.download_button("Download version forecast (CSV)", res.version_fc.to_csv(index=False).encode(),
                        file_name=f"version_forecast_{info['when'][:10]}.csv", mime="text/csv")
 
+# ------------------------------------------------------------------ Explore
+elif page == "Explore":
+    PATTERN_COLORS = {"Smooth": "#2a78d6", "Erratic": "#eb6834", "Intermittent": "#1baf7a", "Lumpy": "#eda100",
+                      "Too short": "#9aa3a0"}
+    st.header("Explore data")
+    st.caption("A profile of the shipments loaded now, before any forecast: data problems, demand patterns, trend, "
+               "seasonality and outliers, with suggested changes to settings and master data.")
+    cfg = db.get_config()
+    ver = db.get_setting("inputs_version", 0) or 0
+
+    @st.cache_data(show_spinner="Profiling the data...")
+    def explore_data(version, level, by_channel, drop_last, chains):
+        d = load_inputs(version)
+        wide, months = explore.build_series(d["items"], d["customers"], d["shipments"], d["hard_transitions"], level,
+                                            nonkey_by_channel=by_channel, drop_last_month=drop_last, combine_chains=chains)
+        return wide, months, explore.profile(wide, months, d["items"])
+
+    @st.cache_data(show_spinner=False)
+    def explore_checks(version, cfg_items):
+        d, c = load_inputs(version), dict(cfg_items)
+        checks = explore.quality_checks(d, c)
+        _, _, prof_f = explore_data(version, "base_group_loc", c["nonkey_by_channel"], c["drop_last_month"], True)
+        keys = sorted(set(engine.customer_groups(d["customers"], c["nonkey_by_channel"]))
+                      - {g for g in engine.customer_groups(d["customers"], c["nonkey_by_channel"]) if g.startswith("All other")})
+        return checks, explore.recommendations(prof_f, checks, c, keys)
+
+    if D["shipments"].empty:
+        st.info("Load shipments on the Data page to explore them.")
+        st.stop()
+
+    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    level = c1.selectbox("Level", list(explore.LEVELS), index=2, format_func=lambda k: explore.LEVELS[k][0])
+    chains = c4.checkbox("Combine hard-transition chains", True,
+                         help="Show a successor base SKU with its predecessor's history, as the forecast does.")
+    wide, months, prof = explore_data(ver, level, bool(cfg["nonkey_by_channel"]), bool(cfg["drop_last_month"]), chains)
+    if prof.empty:
+        st.info("No shipments match the item and customer masters yet.")
+        st.stop()
+    fams = sorted(f for f in prof["family"].unique() if f) if "family" in prof else []
+    fam = c2.selectbox("Family", ["All"] + fams)
+    grp = "All"
+    if "customer_group" in prof:
+        grp = c3.selectbox("Customer group", ["All"] + sorted(prof["customer_group"].unique(),
+                                                             key=lambda g: (g.startswith("All other"), g)))
+    view = prof
+    if fam != "All":
+        view = view[view["family"] == fam]
+    if grp != "All":
+        view = view[view["customer_group"] == grp]
+    act = view[view["months_active"] > 0]
+
+    # ---- 1. health
+    st.subheader("Data health")
+    l12, p12 = act["last12"].sum(), act["prior12"].fillna(0).sum()
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("History", f"{len(months)} months")
+    h1.caption(f"{label(months[0])} to {label(months[-1])}")
+    h2.metric("Series at this level", fmt(len(act)))
+    h3.metric("Shipped, last 12 months", fmt(l12) + " units")
+    h4.metric("Change vs prior 12 months", f"{(l12 / p12 - 1) * 100:+.1f}%" if p12 > 0 else "n/a")
+
+    sel_keys = view.set_index(list(wide.index.names)).index
+    tot = wide.loc[wide.index.isin(sel_keys)].sum(axis=0).clip(lower=0)
+    tdf = pd.DataFrame({"month": months, "qty": tot.values})
+    tdf["avg12"] = tdf["qty"].rolling(12).mean()
+    tx = alt.X("month:N", sort=months, title=None, axis=alt.Axis(
+        values=[m for m in months if m[5:7] in ("01", "04", "07", "10")], labelAngle=0,
+        labelExpr="timeFormat(datetime(parseInt(slice(datum.value,0,4)), parseInt(slice(datum.value,5,7))-1, 1), '%b %y')"))
+    tbars = alt.Chart(tdf).mark_bar(color="#9ec5f4").encode(
+        x=tx, y=alt.Y("qty:Q", title="Units per month"),
+        tooltip=[alt.Tooltip("month:N", title="Month"), alt.Tooltip("qty:Q", title="Units", format=",.0f"),
+                 alt.Tooltip("avg12:Q", title="12-month average", format=",.0f")])
+    tline = alt.Chart(tdf.dropna()).mark_line(color="#1c5cab", strokeWidth=2).encode(x=tx, y="avg12:Q")
+    st.caption("Total monthly shipments for the selection. The line is the 12-month moving average: its slope is the underlying trend.")
+    st.altair_chart((tbars + tline).properties(height=220), width="stretch")
+
+    checks, recs = explore_checks(ver, tuple(sorted(cfg.items())))
+    st.markdown("**Data checks**")
+    if checks.empty:
+        st.success("No data problems found.")
+    else:
+        st.dataframe(checks.rename(columns=str.capitalize), hide_index=True, width="stretch",
+                     column_config={"Detail": st.column_config.TextColumn(width="large"),
+                                    "Examples": st.column_config.TextColumn(width="medium")})
+
+    # ---- 2. recommendations
+    st.subheader("Suggested changes")
+    st.caption("Worked out at the forecast level over all data. Settings are in the sidebar; flags and dates on Master data.")
+    if recs.empty:
+        st.success("Nothing to change: the current settings suit this data.")
+    else:
+        st.dataframe(recs.rename(columns={"area": "What", "current": "Now", "suggested": "Suggested", "why": "Why"}),
+                     hide_index=True, width="stretch", column_config={"Why": st.column_config.TextColumn(width="large")})
+
+    # ---- 3. demand patterns
+    st.subheader("Demand patterns")
+    st.caption(f"Each dot is a series. Average demand interval (ADI) = months per month with shipments; CV² = how much "
+               f"the non-zero quantities vary. Cut-offs at ADI {explore.ADI_CUT} and CV² {explore.CV2_CUT} give four patterns. "
+               "Smooth series forecast well; intermittent and lumpy ones use the Croston model and carry more error.")
+    pc1, pc2 = st.columns([3, 2])
+    sc = act[act["pattern"] != "Too short"].copy()
+    sc["adi_plot"] = sc["adi"].clip(upper=6)
+    sc["cv2_plot"] = sc["cv2"].clip(upper=3)
+    pts = alt.Chart(sc).mark_circle(opacity=0.75, stroke="white", strokeWidth=1).encode(
+        x=alt.X("adi_plot:Q", title="Average demand interval, months (capped at 6)", scale=alt.Scale(domain=[1, 6], zero=False, clamp=True)),
+        y=alt.Y("cv2_plot:Q", title="CV² of non-zero quantities (capped at 3)", scale=alt.Scale(domain=[0, 3])),
+        size=alt.Size("last12:Q", title="Last 12 months", legend=None, scale=alt.Scale(range=[30, 600])),
+        color=alt.Color("pattern:N", title="Pattern", legend=alt.Legend(orient="top"),
+                        scale=alt.Scale(domain=list(PATTERN_COLORS)[:4], range=list(PATTERN_COLORS.values())[:4])),
+        tooltip=[alt.Tooltip("label:N", title="Series"), alt.Tooltip("pattern:N", title="Pattern"),
+                 alt.Tooltip("adi:Q", title="ADI", format=".2f"), alt.Tooltip("cv2:Q", title="CV²", format=".2f"),
+                 alt.Tooltip("last12:Q", title="Last 12 months", format=",.0f")])
+    cuts = alt.Chart(pd.DataFrame({"v": [explore.ADI_CUT]})).mark_rule(strokeDash=[4, 3], color="#888").encode(x="v:Q") + \
+        alt.Chart(pd.DataFrame({"h": [explore.CV2_CUT]})).mark_rule(strokeDash=[4, 3], color="#888").encode(y="h:Q")
+    pc1.altair_chart((cuts + pts).properties(height=320), width="stretch")
+    ps = explore.pattern_summary(view)
+    pc2.markdown("**Series and volume by pattern**")
+    pc2.dataframe(ps.rename(columns={"pattern": "Pattern", "series": "Series", "volume": "Last 12 months",
+                                     "volume_share": "Share of volume"}), hide_index=True, width="stretch",
+                  column_config={"Last 12 months": st.column_config.NumberColumn(format="localized"),
+                                 "Share of volume": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)})
+    pc2.markdown("**ABC x XYZ (number of series)**")
+    pc2.dataframe(explore.abc_xyz(view), width="stretch")
+    pc2.caption("ABC: A = series making the first 80% of last-12-month volume, B the next 15%, C the rest. "
+                "XYZ: variability after removing seasonality; X under 0.5, Y under 1, Z above. AX series are the "
+                "ones to get right; CZ series are best planned at a higher level.")
+
+    # ---- 4. trend and seasonality
+    st.subheader("Trend and seasonality")
+    tc1, tc2 = st.columns(2)
+    tr = act.groupby("trend")["last12"].sum().reindex(["Down", "Flat", "Up", "Too short"]).dropna().reset_index()
+    tr["share"] = tr["last12"] / max(tr["last12"].sum(), 1)
+    tc1.caption(f"Volume by trend: the straight-line slope of the last 36 months after removing seasonality. "
+                f"Up or Down means more than {explore.TREND_CUT:.0f}% a year.")
+    tc1.altair_chart(alt.Chart(tr).mark_bar(cornerRadiusEnd=3).encode(
+        y=alt.Y("trend:N", sort=["Down", "Flat", "Up", "Too short"], title=None),
+        x=alt.X("share:Q", title="Share of last-12-month volume", axis=alt.Axis(format="%")),
+        color=alt.Color("trend:N", legend=None, scale=alt.Scale(domain=["Down", "Flat", "Up", "Too short"],
+                                                               range=["#e34948", "#9aa3a0", "#1baf7a", "#cfd4d2"])),
+        tooltip=[alt.Tooltip("trend:N", title="Trend"), alt.Tooltip("share:Q", title="Share", format=".0%")]
+    ).properties(height=170), width="stretch")
+    pk = act[act["peak_month"] != ""].copy()
+    pk["seasonal"] = np.where(pk["seasonal_strength"] >= 0.4, "Clearly seasonal", "Weak or none")
+    tc2.caption("Volume by peak month. Clearly seasonal = the monthly pattern explains at least 40% of the variation "
+                "(strength 0.4). Series under 24 months are left out.")
+    tc2.altair_chart(alt.Chart(pk).mark_bar().encode(
+        x=alt.X("peak_month:N", sort=explore.MONTHS, title=None, scale=alt.Scale(domain=explore.MONTHS)),
+        y=alt.Y("sum(last12):Q", title="Last 12 months, units"),
+        color=alt.Color("seasonal:N", title=None, legend=alt.Legend(orient="top"),
+                        scale=alt.Scale(domain=["Clearly seasonal", "Weak or none"], range=["#2a78d6", "#cfd4d2"])),
+        tooltip=[alt.Tooltip("peak_month:N", title="Peak"), alt.Tooltip("seasonal:N", title="Seasonality"),
+                 alt.Tooltip("sum(last12):Q", title="Units", format=",.0f")]).properties(height=170), width="stretch")
+
+    # ---- 5. series profiles
+    st.subheader("Series profiles")
+    f1, f2, f3 = st.columns([3, 2, 2])
+    pats = f1.multiselect("Pattern", list(PATTERN_COLORS), default=[], placeholder="All patterns")
+    only_out = f2.checkbox("Only series with outliers")
+    only_inactive = f3.checkbox("Only inactive (6+ months without shipments)")
+    tbl = act
+    if pats:
+        tbl = tbl[tbl["pattern"].isin(pats)]
+    if only_out:
+        tbl = tbl[tbl["outliers"] > 0]
+    if only_inactive:
+        tbl = tbl[tbl["months_since_last"] >= 6]
+    cols = ["label", "family", "abc", "xyz", "pattern", "trend", "trend_pct", "yoy_pct", "seasonal_strength", "peak_month",
+            "cov", "adi", "cv2", "zero_pct", "outliers", "outlier_months", "recent_shift_pct", "months_active",
+            "last_month", "last12"]
+    cols = [c for c in cols if c in tbl.columns]
+    st.dataframe(tbl.sort_values("last12", ascending=False)[cols], hide_index=True, width="stretch", height=360,
+                 column_config={
+                     "label": st.column_config.TextColumn("Series", pinned=True), "family": "Family", "abc": "ABC", "xyz": "XYZ",
+                     "pattern": "Pattern", "trend": "Trend",
+                     "trend_pct": st.column_config.NumberColumn("Trend %/yr", format="%+.0f"),
+                     "yoy_pct": st.column_config.NumberColumn("Last 12 vs prior 12 %", format="%+.0f"),
+                     "seasonal_strength": st.column_config.NumberColumn("Seasonal strength", format="%.2f"),
+                     "peak_month": "Peak", "cov": st.column_config.NumberColumn("Variability (CoV)", format="%.2f"),
+                     "adi": st.column_config.NumberColumn("ADI", format="%.2f"),
+                     "cv2": st.column_config.NumberColumn("CV²", format="%.2f"),
+                     "zero_pct": st.column_config.NumberColumn("Zero months %", format="%.0f"),
+                     "outliers": st.column_config.NumberColumn("Outliers", format="%d"), "outlier_months": "Outlier months",
+                     "recent_shift_pct": st.column_config.NumberColumn("Last 3 vs prior 12 %", format="%+.0f"),
+                     "months_active": st.column_config.NumberColumn("Months of history", format="%d"),
+                     "last_month": "Last shipment", "last12": st.column_config.NumberColumn("Last 12 months", format="localized")})
+    st.download_button("Download profiles (CSV)", tbl[cols].to_csv(index=False).encode(), file_name="series_profiles.csv",
+                       mime="text/csv")
+
+    # ---- 6. drill-down
+    st.subheader("Look at one series")
+    opts = act.sort_values("last12", ascending=False)["label"].tolist()
+    pick_s = st.selectbox("Series", opts, help="Sorted by last-12-month volume")
+    row = act[act["label"] == pick_s].iloc[0]
+    key = tuple(row[k] for k in wide.index.names)
+    y = wide.loc[key if len(key) > 1 else key[0]].values
+    a = explore.analyse(y, engine.month_to_idx(months[0]))
+    st0 = a["_start"]
+    sdf = pd.DataFrame({"month": months[st0:], "qty": np.maximum(y[st0:], 0), "outlier": a["outlier_flags"]})
+    nn = len(sdf)
+    cal = (engine.month_to_idx(months[st0]) + np.arange(nn)) % 12
+    idx = a["indices"] if a.get("seasonal_strength", 0) and a["seasonal_strength"] >= 0.3 else np.ones(12)
+    dd = sdf["qty"].values / idx[cal]
+    if nn >= 12 and dd.mean() > 0:
+        w = min(36, nn)
+        coef = np.polyfit(np.arange(w), dd[-w:], 1)
+        tline_v = np.full(nn, np.nan)
+        tline_v[-w:] = np.polyval(coef, np.arange(w))
+        sdf["trend"] = tline_v
+    sx = alt.X("month:N", sort=months[st0:], title=None, axis=alt.Axis(
+        values=[m for m in months[st0:] if m[5:7] in ("01", "04", "07", "10")], labelAngle=0,
+        labelExpr="timeFormat(datetime(parseInt(slice(datum.value,0,4)), parseInt(slice(datum.value,5,7))-1, 1), '%b %y')"))
+    base_line = alt.Chart(sdf).mark_line(color="#2a78d6", strokeWidth=2, point=alt.OverlayMarkDef(size=25, color="#2a78d6")).encode(
+        x=sx, y=alt.Y("qty:Q", title="Units per month"),
+        tooltip=[alt.Tooltip("month:N", title="Month"), alt.Tooltip("qty:Q", title="Units", format=",.0f")])
+    layers = base_line
+    if "trend" in sdf:
+        layers += alt.Chart(sdf.dropna(subset=["trend"])).mark_line(strokeDash=[5, 4], color="#6b7280").encode(
+            x=sx, y="trend:Q", tooltip=[alt.Tooltip("trend:Q", title="Trend level (deseasonalised)", format=",.0f")])
+    if sdf["outlier"].any():
+        layers += alt.Chart(sdf[sdf["outlier"]]).mark_point(size=160, shape="circle", filled=False, strokeWidth=2.5,
+                                                            color="#e34948").encode(
+            x=sx, y="qty:Q", tooltip=[alt.Tooltip("month:N", title="Outlier"), alt.Tooltip("qty:Q", title="Units", format=",.0f")])
+    d1, d2 = st.columns([3, 1])
+    d1.altair_chart(layers.properties(height=280), width="stretch")
+    d1.caption("Blue: monthly shipments. Dashed: straight-line trend of the deseasonalised level over the last 36 months. "
+               "Red rings: outliers (more than 3.5 robust standard deviations and 25% away from the months around them).")
+    if a["months_active"] >= 24:
+        sidx = pd.DataFrame({"month": explore.MONTHS, "index": a["indices"]})
+        d2.altair_chart(alt.Chart(sidx).mark_bar(cornerRadiusEnd=2, color="#2a78d6").encode(
+            x=alt.X("index:Q", title="Seasonal index (1 = average)"), y=alt.Y("month:N", sort=explore.MONTHS, title=None),
+            tooltip=[alt.Tooltip("month:N"), alt.Tooltip("index:Q", format=".2f")]).properties(height=280), width="stretch")
+    else:
+        d2.info("Under 24 months: no seasonal profile of its own.")
+    facts = [f"**{a['pattern']}** demand, **{a['trend'].lower()}** trend"
+             + (f" ({a['trend_pct']:+.1f}% a year)" if not np.isnan(a.get("trend_pct", np.nan)) else ""),
+             f"seasonal strength {a['seasonal_strength']:.2f}, peak in {a['peak_month']}" if a["months_active"] >= 24
+             else "too short for its own seasonality",
+             f"{a['zero_pct']:.0f}% of months with no shipments",
+             f"{a['outliers']} outlier{'s' if a['outliers'] != 1 else ''}" + (f": {a['outlier_months']}" if a["outliers"] else "")]
+    st.markdown("; ".join(facts) + ".")
+
 # ------------------------------------------------------------------ Lifecycle
 elif page == "Lifecycle":
     st.header("Lifecycle")
@@ -462,27 +732,95 @@ elif page == "Data":
     if not D["shipments"].empty:
         st.caption(f"Shipment history runs {label(D['shipments']['month'].min())} to {label(D['shipments']['month'].max())}.")
 
-    st.subheader("Load your files")
-    st.write("CSV or Excel, one file per table, first row as headers. Load the three masters first, then shipments. "
-             "Daily shipment lines are summed to months.")
-    specs = [("items", "Item master", "version_sku, base_sku required. Optional: description, base_description, version_seq, "
-                                      "family, forecastable (Y/N), status, launch_date, discontinue_date."),
-             ("customers", "Customer master", "account required. Optional: name, channel, key_customer (Y/N), customer_group."),
-             ("locations", "Location master", "location required. Optional: name, type, region."),
-             ("shipments", "Shipments", "ship_date, version_sku, account, location, quantity.")]
-    for tab, (table, title, cols) in zip(st.tabs([s[1] for s in specs]), specs):
+    rule_counts = {t: db.count(t) for t in ("version_transitions", "hard_transitions", "new_products", "split_settings", "manual_split")}
+    st.caption("Rules loaded: " + " · ".join(f"{dataio.SPEC[t][1]} {n:,}" for t, n in rule_counts.items()))
+
+    XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ORDER = [s[0] for s in dataio.SPECS]
+
+    def load_table(table, clean, mode="Replace everything"):
+        if table == "shipments" and mode != "Replace everything":
+            db.upsert_shipments(clean)
+        else:
+            db.write(table, clean)
+
+    st.subheader("Load everything from one workbook")
+    st.write("One Excel file with a sheet per table: items, customers, locations, shipments, version transitions, "
+             "hard transitions, new products, split methods and manual split percentages. Sheets you leave out are not changed.")
+    w1, w2, _ = st.columns([2, 2, 3])
+    w1.download_button("Download blank template", dataio.template_workbook(), file_name="demand_planner_template.xlsx",
+                       mime=XLSX, key="tpl_book")
+    if not D["items"].empty:
+        w2.download_button("Download what is loaded now", dataio.current_data_workbook(D),
+                           file_name=f"demand_planner_data_{dt.date.today():%Y-%m-%d}.xlsx", mime=XLSX, key="cur_book",
+                           help="Edit it in Excel and load it back here.")
+    book = st.file_uploader("Workbook", type=["xlsx", "xlsm"], key="up_book")
+    if book is not None:
+        try:
+            raw, other = dataio.read_workbook(book)
+        except Exception as e:
+            st.error(f"Could not read this workbook. {e}")
+            raw, other = {}, []
+        if other:
+            st.caption("Sheets not recognised and ignored: " + ", ".join(other))
+        if raw:
+            ship_mode = "Replace everything"
+            if "shipments" in raw:
+                ship_mode = st.radio("Shipments in the workbook", ["Replace the months in the file, keep the rest",
+                                                                   "Replace everything"], key="book_ship_mode")
+            # Check in load order, so rules are checked against the masters in the same workbook.
+            ref = dict(D)
+            ready, summary, failed = {}, [], False
+            for t in [t for t in ORDER if t in raw]:
+                try:
+                    clean, issues = dataio.normalize(t, raw[t])
+                    if t in dataio.RULE_KEYS:
+                        clean, warn = dataio.check_references(t, clean, ref)
+                        issues += warn
+                    ready[t] = clean
+                    if t in ("items", "customers"):
+                        ref[t] = clean
+                    summary.append({"Sheet": dataio.SPEC[t][2], "Rows ready": len(clean),
+                                    "Notes": " ".join(issues) or "OK"})
+                except Exception as e:
+                    failed = True
+                    summary.append({"Sheet": dataio.SPEC[t][2], "Rows ready": 0, "Notes": f"Not loadable: {e}"})
+            st.dataframe(pd.DataFrame(summary), hide_index=True, width="stretch",
+                         column_config={"Notes": st.column_config.TextColumn(width="large")})
+            if failed:
+                st.warning("Fix the sheets marked Not loadable, or delete them from the workbook, then upload it again. "
+                           "Nothing has been loaded.")
+            elif st.button(f"Load {len(ready)} sheet{'s' if len(ready) > 1 else ''}", type="primary", key="load_book"):
+                for t in ORDER:
+                    if t in ready:
+                        load_table(t, ready[t], ship_mode)
+                st.session_state["flash"] = ("Loaded: " + ", ".join(f"{dataio.SPEC[t][1].lower()} {len(ready[t]):,}" for t in ORDER if t in ready)
+                                             + ". Run the forecast to use it.")
+                st.rerun()
+        elif not other:
+            st.error("No recognised sheets. Use the sheet names from the template.")
+
+    st.subheader("Load one table at a time")
+    st.write("CSV or Excel, first row as headers. Load the masters before shipments and rules. "
+             "Daily shipment lines are summed to months. Common header names are recognised.")
+    for tab, (table, title, sheet, req, opt) in zip(st.tabs([s[1] for s in dataio.SPECS]), dataio.SPECS):
         with tab:
-            st.caption("Columns: " + cols)
+            st.caption(f"Required: {req}." + (f" Optional: {opt}." if opt else ""))
             st.download_button("Download template", dataio.template_csv(table), file_name=f"{table}_template.csv",
                                mime="text/csv", key=f"tpl_{table}")
             mode = "Replace everything"
             if table == "shipments":
                 mode = st.radio("How to load", ["Replace the months in the file, keep the rest", "Replace everything"],
                                 key="ship_mode")
+            elif table in dataio.RULE_KEYS:
+                st.caption("Loading replaces every row of this table.")
             up = st.file_uploader(f"{title} file", type=["csv", "xlsx", "xls", "txt"], key=f"up_{table}")
             if up is not None:
                 try:
                     clean, issues = dataio.normalize(table, dataio.read_upload(up))
+                    if table in dataio.RULE_KEYS:
+                        clean, warn = dataio.check_references(table, clean, D)
+                        issues += warn
                 except Exception as e:  # show the reason, load nothing
                     st.error(f"Could not read this file. {e}")
                 else:
@@ -491,10 +829,7 @@ elif page == "Data":
                         st.warning(i)
                     st.dataframe(clean.head(20), hide_index=True, width="stretch")
                     if st.button(f"Load {title.lower()}", type="primary", key=f"load_{table}"):
-                        if table == "shipments" and mode != "Replace everything":
-                            db.upsert_shipments(clean)
-                        else:
-                            db.write(table, clean)
+                        load_table(table, clean, mode)
                         st.session_state["flash"] = f"{title} loaded: {len(clean):,} rows. Run the forecast to use it."
                         st.rerun()
 

@@ -13,6 +13,9 @@ Everything works on month indexes (year * 12 + month - 1).
 """
 from __future__ import annotations
 
+import os
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -28,7 +31,17 @@ DEFAULTS = {
     "npi_own_history_months": 6,  # own history after which a new item stops borrowing
     "nonkey_by_channel": False,   # one "All other" bucket per channel instead of one overall
     "drop_last_month": False,     # ignore the latest month if it is incomplete
+    "arima": True,                # try ARIMA and SARIMA candidates (slower; needs statsmodels)
+    "workers": 0,                 # processes for the forecast; 0 = all cores but one
 }
+PARALLEL_MIN_SERIES = int(os.environ.get("PLANNER_PARALLEL_MIN", 100))  # below this, starting workers costs more than it saves
+
+try:  # ARIMA / SARIMA come from statsmodels; the engine still runs without it.
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    HAS_STATSMODELS = True
+except Exception:  # pragma: no cover
+    SARIMAX = None
+    HAS_STATSMODELS = False
 
 
 # ---------------------------------------------------------------- months
@@ -131,16 +144,82 @@ def _croston(y, cal0, h, **_):
     return np.full(h, (1 - a / 2) * z / max(p, 1.0))
 
 
+# ARIMA family. Orders inside a family share the same differencing, so AIC can rank them;
+# the family winner then competes with the other models on the holdout like any candidate.
+ARIMA_ORDERS = [(0, 1, 1), (1, 1, 0), (1, 1, 1)]
+SARIMA_ORDERS = [((0, 1, 1), (0, 1, 1, 12)), ((1, 1, 0), (0, 1, 1, 12)), ((1, 1, 1), (0, 1, 1, 12))]
+ARIMA_MIN_TRAIN = 18     # months needed to fit an ARIMA
+SARIMA_MIN_TRAIN = 30    # months needed to fit a SARIMA with seasonal differencing
+EXPLOSION_CAP = 3.0      # reject an ARIMA forecast that goes above 3x the highest month in history
+
+
+def _fit_sarimax(y, order, seasonal_order=(0, 0, 0, 0)):
+    """Fit on the pre-differenced series (much faster than differencing inside the state space)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return SARIMAX(y, order=order, seasonal_order=seasonal_order, trend="n", simple_differencing=True,
+                       concentrate_scale=True, enforce_stationarity=False,
+                       enforce_invertibility=False).fit(disp=False, maxiter=50)
+
+
+def _undifference(y, w, d, D):
+    """Turn forecasts of the differenced series back into units: undo (1-B)^d (1-B^12)^D."""
+    hist, out = list(map(float, y)), []
+    for x in w:
+        v = x + (hist[-1] if d else 0.0) + (hist[-12] if D else 0.0) - (hist[-13] if d and D else 0.0)
+        hist.append(v)
+        out.append(v)
+    return np.array(out)
+
+
+def _arima_family(y, h, orders, seasonal, fixed=None):
+    """Fit each order (or only `fixed`), keep the lowest AIC. Returns (forecast, label) or None."""
+    best = None
+    for o in ([fixed] if fixed else orders):
+        order, so = (o if seasonal else (o, (0, 0, 0, 0)))
+        try:
+            r = _fit_sarimax(y, order, so)
+        except Exception:
+            continue
+        if not np.isfinite(r.aic):
+            continue
+        if best is None or r.aic < best[0]:
+            best = (r.aic, o, r)
+    if best is None:
+        return None
+    _, o, r = best
+    order, so = (o if seasonal else (o, (0, 0, 0, 0)))
+    f = _undifference(y, np.asarray(r.forecast(h), dtype=float), order[1], so[1])
+    if not np.all(np.isfinite(f)) or f.max() > EXPLOSION_CAP * max(y.max(), 1.0):
+        return None
+    if seasonal:
+        (p, d, q), (P, D, Q, m) = o
+        label = f"SARIMA({p},{d},{q})({P},{D},{Q})12"
+    else:
+        label = "ARIMA({},{},{})".format(*o)
+    return np.maximum(f, 0.0), label, o
+
+
+def _arima(y, cal0, h, fixed=None, **_):
+    return _arima_family(y, h, ARIMA_ORDERS, False, fixed)
+
+
+def _sarima(y, cal0, h, fixed=None, **_):
+    return _arima_family(y, h, SARIMA_ORDERS, True, fixed)
+
+
 M_SES = "Exponential smoothing"
 M_SNAIVE = "Seasonal naive"
 M_DAMPED = "Seasonal with damped trend"
 M_FAMILY = "Family seasonal profile"
 M_CROSTON = "Intermittent (Croston)"
 M_NONE = "No history"
+M_ARIMA = "ARIMA"
+M_SARIMA = "SARIMA"
 
 
 def select_model(y: np.ndarray, cal0: int, h: int, *, seasonal=True, fam_idx=None,
-                 holdout=6, min_seasonal=24) -> dict:
+                 holdout=6, min_seasonal=24, arima=False) -> dict:
     """Fit candidate models, pick the best on a holdout, refit on all history.
 
     y starts at the first month with shipments; cal0 is that month's calendar
@@ -162,6 +241,12 @@ def select_model(y: np.ndarray, cal0: int, h: int, *, seasonal=True, fam_idx=Non
             cands[M_FAMILY] = _family_profile
 
     ho = holdout if n - holdout >= 12 else (3 if n >= 8 else 0)
+    sparse = n >= 6 and (y == 0).mean() >= 0.4
+    if arima and HAS_STATSMODELS and ho and not sparse:
+        if n - ho >= ARIMA_MIN_TRAIN:
+            cands[M_ARIMA] = _arima
+        if seasonal and n - ho >= SARIMA_MIN_TRAIN:
+            cands[M_SARIMA] = _sarima
     if ho == 0:
         # Too short to backtest: a family profile is the better prior when there is one.
         name = M_FAMILY if M_FAMILY in cands else M_SES
@@ -171,13 +256,70 @@ def select_model(y: np.ndarray, cal0: int, h: int, *, seasonal=True, fam_idx=Non
     train, test = y[:-ho], y[-ho:]
     best = None
     for name, fn in cands.items():
-        p = fn(train, cal0, ho, fam_idx=fam_idx)
+        out = fn(train, cal0, ho, fam_idx=fam_idx)
+        if out is None:          # an ARIMA that failed to fit or exploded
+            continue
+        p, label, fixed = out if isinstance(out, tuple) else (out, name, None)
         ae = float(np.abs(p - test).sum())
         if best is None or ae < best[1]:
-            best = (name, ae, float((p - test).sum()))
-    name, ae, er = best
-    return dict(f=cands[name](y, cal0, h, fam_idx=fam_idx), model=name,
-                abs_err=ae, err=er, act=float(test.sum()), n=n)
+            best = (name, ae, float((p - test).sum()), label, fixed)
+    name, ae, er, label, fixed = best
+    # Refit on all history. An ARIMA keeps the order it was backtested with.
+    out = cands[name](y, cal0, h, fam_idx=fam_idx, fixed=fixed)
+    if out is None:              # refit failed: fall back to exponential smoothing
+        return dict(f=_ses(y, cal0, h), model=M_SES, abs_err=ae, err=er, act=float(test.sum()), n=n)
+    f = out[0] if isinstance(out, tuple) else out
+    return dict(f=f, model=label, abs_err=ae, err=er, act=float(test.sum()), n=n)
+
+
+# ---------------------------------------------------------------- running many series
+def _forecast_chunk(chunk, h, opts):
+    """Worker: forecast a list of (key, y, cal0, fam_idx). Top level so worker processes can import it."""
+    return [(key, select_model(y, cal0, h, fam_idx=fi, **opts)) for key, y, cal0, fi in chunk]
+
+
+def worker_count(cfg) -> int:
+    n = int(cfg.get("workers", 0) or 0)
+    return max(1, n if n > 0 else (os.cpu_count() or 2) - 1)
+
+
+LAST_RUN = {"workers": 1}
+
+
+def _forecast_all(tasks, h, opts, cfg, progress=None):
+    """Forecast every series. ARIMA runs are spread over worker processes; anything else runs here.
+
+    Results come back in the order of `tasks`, so a run gives the same output however it is split.
+    """
+    n = len(tasks)
+    workers = min(worker_count(cfg), n)
+    if opts.get("arima") and HAS_STATSMODELS and workers > 1 and n >= PARALLEL_MIN_SERIES:
+        size = max(4, min(50, n // (workers * 4) or 1))
+        chunks = [tasks[i:i + size] for i in range(0, n, size)]
+        done, results = 0, {}
+        # One maths-library thread per worker: otherwise each worker starts a thread per core and they fight.
+        for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(v, "1")
+        try:
+            import multiprocessing as mp
+            with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
+                futs = {pool.submit(_forecast_chunk, c, h, opts): i for i, c in enumerate(chunks)}
+                for fut in as_completed(futs):
+                    results[futs[fut]] = fut.result()
+                    done += len(chunks[futs[fut]])
+                    if progress:
+                        progress(done / n)
+            LAST_RUN["workers"] = workers
+            return [r for i in range(len(chunks)) for r in results[i]]
+        except Exception:
+            pass  # worker processes not available here: fall back to one process
+    LAST_RUN["workers"] = 1
+    out = []
+    for i, t in enumerate(tasks):
+        if progress and i % 10 == 0:
+            progress(i / max(n, 1))
+        out.extend(_forecast_chunk([t], h, opts))
+    return out
 
 
 # ---------------------------------------------------------------- result
@@ -357,17 +499,15 @@ def run_forecast(items, customers, locations, shipments, version_transitions,
 
     fc_root: dict[tuple, np.ndarray] = {}
     meta = []
-    n_series = len(plan)
-    for i, (key, row) in enumerate(zip(plan.index, plan.values)):
-        if progress and i % 200 == 0:
-            progress(i / max(n_series, 1))
+    tasks = []
+    for key, row in zip(plan.index, plan.values):
         nz = np.flatnonzero(row > 0)
         if len(nz) == 0:
             continue
-        y = row[nz[0]:]
-        res = select_model(y, (t0 + nz[0]) % 12, F, seasonal=bool(cfg["seasonal"]),
-                           fam_idx=fam_idx.get(base_family.get(key[0], "")),
-                           holdout=int(cfg["holdout"]), min_seasonal=int(cfg["min_seasonal_months"]))
+        tasks.append((key, row[nz[0]:], (t0 + nz[0]) % 12, fam_idx.get(base_family.get(key[0], ""))))
+    opts = dict(seasonal=bool(cfg["seasonal"]), holdout=int(cfg["holdout"]),
+                min_seasonal=int(cfg["min_seasonal_months"]), arima=bool(cfg["arima"]))
+    for key, res in _forecast_all(tasks, F, opts, cfg, progress):
         fc_root[key] = res["f"]
         meta.append((*key, res["model"], res["abs_err"], res["err"], res["act"], res["n"]))
     series = pd.DataFrame(meta, columns=["root_base", "customer_group", "location", "model",

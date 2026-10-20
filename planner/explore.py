@@ -98,7 +98,9 @@ def _seasonality(y: np.ndarray, cal0: int) -> tuple[np.ndarray, float]:
     # With two or three years, noise alone explains some variation by chance: discount for it.
     years = len(r) / 12
     chance = 11 / max(len(r) - 1, 1)
-    strength = float(max(0.0, (strength - chance) / (1 - chance))) if years < 6 else strength
+    if years < 6:
+        # too few ratios for any of the variation to be told apart from chance
+        strength = float(max(0.0, (strength - chance) / (1 - chance))) if chance < 1 else 0.0
     return idx, strength
 
 

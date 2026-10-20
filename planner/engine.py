@@ -33,6 +33,8 @@ DEFAULTS = {
     "drop_last_month": False,     # ignore the latest month if it is incomplete
     "arima": True,                # try ARIMA and SARIMA candidates (slower; needs statsmodels)
     "workers": 0,                 # processes for the forecast; 0 = all cores but one
+    "season_decay": 1.0,          # weight of each older year in seasonal indices (1 = all years equal, 0.5 = halves per year)
+    "cap_outliers": False,        # cap one-off spikes and dips in history before fitting (scoring uses raw actuals)
 }
 PARALLEL_MIN_SERIES = int(os.environ.get("PLANNER_PARALLEL_MIN", 100))  # below this, starting workers costs more than it saves
 
@@ -63,26 +65,42 @@ _ALPHAS = np.round(np.arange(0.1, 0.95, 0.1), 2)
 _PHI = 0.9
 
 
-def seasonal_indices(y: np.ndarray, cal0: int) -> np.ndarray:
-    """Ratio-to-centred-moving-average indices by calendar month (mean 1)."""
+SEASON_MIN, SEASON_MAX = 0.25, 4.0   # bounds on a seasonal index
+
+
+def seasonal_indices(y: np.ndarray, cal0: int, decay: float = 1.0) -> np.ndarray:
+    """Seasonal indices by calendar month (mean 1), from ratios to a centred 12-month moving average.
+
+    Built to stay steady on short, noisy histories:
+      - ratios beyond 3 robust standard deviations are clipped, so one spike cannot make a peak;
+      - each month's index is pulled toward 1 by k/(k+1), k = years of ratios behind it,
+        so a month seen once counts half;
+      - indices stay between 0.25 and 4.
+    decay < 1 weights recent years more (a ratio one year older counts decay times as much).
+    """
     n = len(y)
     if n < 13:
         return np.ones(12)
-    kernel = np.r_[0.5, np.ones(11), 0.5] / 12.0
-    ma = np.convolve(y, kernel, mode="valid")  # centred on t = 6 .. n-7
-    buckets: list[list[float]] = [[] for _ in range(12)]
-    for k, s in enumerate(ma):
-        if s > 0:
-            t = k + 6
-            buckets[(cal0 + t) % 12].append(y[t] / s)
-    idx = np.array([np.mean(b) if b else np.nan for b in buckets])
-    if np.isnan(idx).all():
+    ma = np.convolve(y, np.r_[0.5, np.ones(11), 0.5] / 12.0, mode="valid")  # centred on t = 6 .. n-7
+    t = np.arange(6, n - 6)
+    ok = ma > 0
+    if ok.sum() < 6:
         return np.ones(12)
-    idx = np.where(np.isnan(idx), np.nanmean(idx), idx)
-    mean = idx.mean()
-    if mean <= 0:
-        return np.ones(12)
-    return np.maximum(idx / mean, 0.05)
+    r, tt = y[t][ok] / ma[ok], t[ok]
+    med = np.median(r)
+    sd = 1.4826 * np.median(np.abs(r - med))
+    if sd > 0:
+        r = np.clip(r, med - 3 * sd, med + 3 * sd)
+    cal, w = (cal0 + tt) % 12, decay ** ((n - 1 - tt) / 12.0)
+    idx = np.ones(12)
+    for m in range(12):
+        sel = cal == m
+        k = int(sel.sum())
+        if k:
+            raw = np.average(r[sel], weights=w[sel])
+            idx[m] = 1 + (raw - 1) * k / (k + 1)
+    idx = np.clip(idx / idx.mean(), SEASON_MIN, SEASON_MAX)
+    return idx / idx.mean()
 
 
 def _ses(y, cal0, h, **_):
@@ -122,8 +140,34 @@ def _damped(y, cal0, h, idx):
     return np.maximum(0.0, (level + damp * trend) * idx[(cal0 + n + np.arange(h)) % 12])
 
 
-def _seasonal_damped(y, cal0, h, **_):
-    return _damped(y, cal0, h, seasonal_indices(y, cal0))
+def _seasonal_damped(y, cal0, h, decay=1.0, **_):
+    return _damped(y, cal0, h, seasonal_indices(y, cal0, decay))
+
+
+OUTLIER_Z = 3.5        # robust z-score beyond which a month is capped
+OUTLIER_MIN_DEV = 0.25  # ...and it must be at least 25% away from the months around it
+
+
+def cap_outliers(y: np.ndarray, cal0: int) -> np.ndarray:
+    """Replace one-off spikes and dips with the level of the months around them (seasonality kept)."""
+    n = len(y)
+    if n < 12 or (y == 0).mean() >= 0.4:
+        return y
+    idx = seasonal_indices(y, cal0) if n >= 24 else np.ones(12)
+    cal = (cal0 + np.arange(n)) % 12
+    d = np.log1p(y / idx[cal])
+    med = np.array([np.median(np.r_[d[max(0, i - 3):i], d[i + 1:i + 4]]) for i in range(n)])
+    r = d - med
+    mad = np.median(np.abs(r - np.median(r)))
+    scale = mad / 0.6745 if mad > 0 else np.mean(np.abs(r)) * 1.2533
+    if scale <= 0:
+        return y
+    flag = (np.abs(r / scale) > OUTLIER_Z) & (np.abs(np.expm1(r)) > OUTLIER_MIN_DEV)
+    if not flag.any():
+        return y
+    out = y.copy()
+    out[flag] = np.expm1(med[flag]) * idx[cal[flag]]
+    return np.maximum(out, 0.0)
 
 
 def _family_profile(y, cal0, h, fam_idx=None, **_):
@@ -214,12 +258,27 @@ M_DAMPED = "Seasonal with damped trend"
 M_FAMILY = "Family seasonal profile"
 M_CROSTON = "Intermittent (Croston)"
 M_NONE = "No history"
+SANITY_12M = 1.5   # a forecast's next 12 months may not exceed 1.5x the highest 12-month total in history
+
+
+def sane(f: np.ndarray, y: np.ndarray) -> bool:
+    """False for a forecast that runs far above anything in the history it was fitted on."""
+    if not np.all(np.isfinite(f)):
+        return False
+    k = min(12, len(f))
+    if len(y) >= 12:
+        top = np.convolve(y, np.ones(12), mode="valid").max()
+    else:
+        top = y.mean() * 12
+    return f[:k].sum() <= SANITY_12M * max(top, 1.0) * k / 12 and f.max() <= 3 * max(y.max(), 1.0)
+
+
 M_ARIMA = "ARIMA"
 M_SARIMA = "SARIMA"
 
 
 def select_model(y: np.ndarray, cal0: int, h: int, *, seasonal=True, fam_idx=None,
-                 holdout=6, min_seasonal=24, arima=False) -> dict:
+                 holdout=6, min_seasonal=24, arima=False, season_decay=1.0, cap=False) -> dict:
     """Fit candidate models, pick the best on a holdout, refit on all history.
 
     y starts at the first month with shipments; cal0 is that month's calendar
@@ -250,26 +309,37 @@ def select_model(y: np.ndarray, cal0: int, h: int, *, seasonal=True, fam_idx=Non
     if ho == 0:
         # Too short to backtest: a family profile is the better prior when there is one.
         name = M_FAMILY if M_FAMILY in cands else M_SES
-        return dict(f=cands[name](y, cal0, h, fam_idx=fam_idx), model=name,
+        return dict(f=cands[name](y, cal0, h, fam_idx=fam_idx, decay=season_decay), model=name,
                     abs_err=0.0, err=0.0, act=0.0, n=n)
 
     train, test = y[:-ho], y[-ho:]
-    best = None
+    fit_train = cap_outliers(train, cal0) if cap else train
+    fit_all = cap_outliers(y, cal0) if cap else y
+    scored = []
     for name, fn in cands.items():
-        out = fn(train, cal0, ho, fam_idx=fam_idx)
+        out = fn(fit_train, cal0, ho, fam_idx=fam_idx, decay=season_decay)
         if out is None:          # an ARIMA that failed to fit or exploded
             continue
         p, label, fixed = out if isinstance(out, tuple) else (out, name, None)
-        ae = float(np.abs(p - test).sum())
-        if best is None or ae < best[1]:
-            best = (name, ae, float((p - test).sum()), label, fixed)
-    name, ae, er, label, fixed = best
-    # Refit on all history. An ARIMA keeps the order it was backtested with.
-    out = cands[name](y, cal0, h, fam_idx=fam_idx, fixed=fixed)
-    if out is None:              # refit failed: fall back to exponential smoothing
-        return dict(f=_ses(y, cal0, h), model=M_SES, abs_err=ae, err=er, act=float(test.sum()), n=n)
-    f = out[0] if isinstance(out, tuple) else out
-    return dict(f=f, model=label, abs_err=ae, err=er, act=float(test.sum()), n=n)
+        if not sane(np.r_[p, np.full(max(0, 12 - ho), p.mean())], fit_train):
+            continue             # forecast far above anything in its history
+        scored.append((float(np.abs(p - test).sum()), name, float((p - test).sum()), label, fixed, p))
+    scored.sort(key=lambda x: x[0])
+    # Refit the best on all history. An ARIMA keeps the order it was backtested with.
+    # A refit that fails or runs far above history passes the choice to the next best.
+    # bt_f / bt_a: the winner's holdout forecast and the actuals, month by month, so error can be
+    # measured after adding series together (base SKU, customer group) and not only per series.
+    for ae, name, er, label, fixed, p in scored:
+        out = cands[name](fit_all, cal0, h, fam_idx=fam_idx, fixed=fixed, decay=season_decay)
+        if out is None:
+            continue
+        f = out[0] if isinstance(out, tuple) else out
+        if sane(f, fit_all):
+            return dict(f=f, model=label, abs_err=ae, err=er, act=float(test.sum()), n=n, bt_f=p, bt_a=test)
+    if not scored:
+        return dict(f=_ses(fit_all, cal0, h), model=M_SES, abs_err=0.0, err=0.0, act=0.0, n=n)
+    ae, er, p = scored[0][0], scored[0][2], scored[0][5]
+    return dict(f=_ses(fit_all, cal0, h), model=M_SES, abs_err=ae, err=er, act=float(test.sum()), n=n, bt_f=p, bt_a=test)
 
 
 # ---------------------------------------------------------------- running many series
@@ -332,6 +402,7 @@ class Result:
     version_fc: pd.DataFrame = None  # version_sku, base_sku, customer_group, location, month, qty
     unallocated: pd.DataFrame = None  # base_sku, customer_group, location, month, qty
     series: pd.DataFrame = None      # root_base, customer_group, location, model, abs_err, err, act, n_months
+    backtest: pd.DataFrame = None    # root_base, customer_group, location, month, fc, act (holdout months)
     chains: pd.DataFrame = None      # base_sku, root_base, source ("own" | "like item <x>")
     exceptions: pd.DataFrame = None  # type, key, detail, rows, qty
 
@@ -495,7 +566,7 @@ def run_forecast(items, customers, locations, shipments, version_transitions,
             y = tot.values
             nz = np.flatnonzero(y > 0)
             if fam and len(nz) and H - nz[0] >= int(cfg["min_seasonal_months"]):
-                fam_idx[fam] = seasonal_indices(y[nz[0]:], (t0 + nz[0]) % 12)
+                fam_idx[fam] = seasonal_indices(y[nz[0]:], (t0 + nz[0]) % 12, float(cfg["season_decay"]))
 
     fc_root: dict[tuple, np.ndarray] = {}
     meta = []
@@ -506,10 +577,16 @@ def run_forecast(items, customers, locations, shipments, version_transitions,
             continue
         tasks.append((key, row[nz[0]:], (t0 + nz[0]) % 12, fam_idx.get(base_family.get(key[0], ""))))
     opts = dict(seasonal=bool(cfg["seasonal"]), holdout=int(cfg["holdout"]),
-                min_seasonal=int(cfg["min_seasonal_months"]), arima=bool(cfg["arima"]))
+                min_seasonal=int(cfg["min_seasonal_months"]), arima=bool(cfg["arima"]),
+                season_decay=float(cfg["season_decay"]), cap=bool(cfg["cap_outliers"]))
+    bt_rows = []
     for key, res in _forecast_all(tasks, F, opts, cfg, progress):
         fc_root[key] = res["f"]
         meta.append((*key, res["model"], res["abs_err"], res["err"], res["act"], res["n"]))
+        if res.get("bt_a") is not None:
+            ms = hist_months[-len(res["bt_a"]):]
+            bt_rows += [(*key, m_, float(f_), float(a_)) for m_, f_, a_ in zip(ms, res["bt_f"], res["bt_a"])]
+    backtest = pd.DataFrame(bt_rows, columns=["root_base", "customer_group", "location", "month", "fc", "act"])
     series = pd.DataFrame(meta, columns=["root_base", "customer_group", "location", "model",
                                          "abs_err", "err", "act", "n_months"])
 
@@ -652,6 +729,7 @@ def run_forecast(items, customers, locations, shipments, version_transitions,
     res.version_fc = _long(ver_rows, ["version_sku", "base_sku", "customer_group", "location"], fc_months)
     res.unallocated = _long(un_rows, ["base_sku", "customer_group", "location"], fc_months)
     res.series = series
+    res.backtest = backtest
     res.chains = pd.DataFrame(
         [(b, root[npi[b]["like"]] if b in npi else root[b],
           f"like item {npi[b]['like']}" if b in npi else "own") for b in sorted(all_bases)],

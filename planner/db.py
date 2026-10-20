@@ -25,7 +25,7 @@ SCHEMA = {
     "split_settings": ["base_sku", "method"],
     "manual_split": ["base_sku", "version_sku", "pct"],
 }
-RESULT_TABLES = ["hist", "base_fc", "version_fc", "unallocated", "series", "chains", "exceptions"]
+RESULT_TABLES = ["hist", "base_fc", "version_fc", "unallocated", "series", "chains", "exceptions", "backtest"]
 NUMERIC = {"version_seq": "Int64", "qty": "float", "scale": "float", "pct": "float"}
 BOOL = {"forecastable", "key_customer"}
 
@@ -145,7 +145,10 @@ def load_result() -> tuple[Result | None, dict | None]:
     res = Result(hist_months=info["hist_months"], fc_months=info["fc_months"])
     with connect() as con:
         for t in RESULT_TABLES:
-            setattr(res, t, pd.read_sql(f"SELECT * FROM res_{t}", con))
+            try:
+                setattr(res, t, pd.read_sql(f"SELECT * FROM res_{t}", con))
+            except Exception:  # a run saved before this table existed
+                setattr(res, t, None)
     return res, info
 
 

@@ -11,10 +11,10 @@ import streamlit as st
 
 import importlib
 
-from planner import dataio, db, engine, explore, sample
+from planner import accuracy, breakdown, dataio, db, demo, engine, explore, sample
 
 # Pick up edits to the planner package without restarting the app.
-for _m in (engine, db, dataio, explore, sample):
+for _m in (engine, db, dataio, explore, breakdown, sample, demo, accuracy):
     importlib.reload(_m)
 from planner.engine import ALL, DEFAULTS, run_forecast  # noqa: E402
 
@@ -83,6 +83,13 @@ def do_run() -> bool:
     return True
 
 
+def load_demo():
+    with st.spinner("Loading the demo dataset..."):
+        demo.load()
+    st.cache_data.clear()
+    do_run()
+
+
 def load_sample():
     db.reset()
     for table, df in sample.build().items():
@@ -147,6 +154,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+if demo.is_demo_mode() or db.get_setting("dataset") == "demo-m5":
+    st.caption(demo.NOTE + " See DEMO_DATA.md in the app folder.")
 
 if "flash" in st.session_state:
     st.success(st.session_state.pop("flash"))
@@ -156,10 +165,21 @@ res, info = result()
 
 if D["items"].empty and page != "Data":
     st.header("Start by loading data")
+    if demo.is_demo_mode() and demo.available():
+        st.write("This is the demo copy of the app. Load the demo dataset: 1,000 Walmart food and household "
+                 "products across 10 stores and 3 DCs, with versions, transitions and launches added.")
+        if st.button("Load demo dataset", type="primary"):
+            load_demo()
+            st.rerun()
+        st.stop()
     st.write("The database is empty. Load the sample data to see how the planner works, "
              "or go to the Data page to load your own item, customer, location and shipment files.")
-    if st.button("Load sample data", type="primary"):
+    c1, c2, _ = st.columns([2, 2, 4])
+    if c1.button("Load sample data", type="primary"):
         load_sample()
+        st.rerun()
+    if demo.available() and c2.button("Load demo dataset (M5)"):
+        load_demo()
         st.rerun()
     st.stop()
 
@@ -167,6 +187,43 @@ if res is None and page in ("Forecast", "Lifecycle", "Accuracy"):
     st.header(page)
     st.info("No forecast yet. Press Run forecast in the sidebar.")
     st.stop()
+
+
+DIMS = {"Location": "location", "Customer group": "customer_group", "Account": "account"}
+
+
+@st.cache_data(show_spinner="Splitting the forecast by account...")
+def account_frames(when: str, version: int):
+    """Account-level history, version forecast and unallocated forecast for the last run."""
+    r, inf = db.load_result()
+    d = load_inputs(version)
+    nk = bool(inf["config"].get("nonkey_by_channel", False))
+    ha = breakdown.account_history(d["shipments"], d["items"], d["customers"], r.hist_months, nk)
+    va = breakdown.split_by_account(r.version_fc, ha, d["customers"], r.hist_months, nk)
+    ua = breakdown.split_by_account(r.unallocated, ha, d["customers"], r.hist_months, nk)
+    return ha, va, ua
+
+
+def level_wape_text(bt) -> str:
+    """'Base SKU 21% · customer group 26%' for the backtest rows in view."""
+    if bt is None:
+        return "Run the forecast to see base SKU and customer group levels"
+    if bt.empty:
+        return ""
+    b = accuracy.measure(bt, ["root_base"])["wape"]
+    g = accuracy.measure(bt, ["root_base", "customer_group"])["wape"]
+    return f"Base SKU level {b:.1f}% · customer group level {g:.1f}%"
+
+
+def account_names() -> dict[str, str]:
+    c = D["customers"]
+    return {a: (f"{a} · {n}" if n else a) for a, n in zip(c["account"].astype(str), c["name"].fillna(""))}
+
+
+def breakdown_rows(df: pd.DataFrame, dimcols: list[str], months: list[str]) -> pd.DataFrame:
+    """Months across, one row per combination of dimcols."""
+    w = df.pivot_table(index=dimcols, columns="month", values="qty", aggfunc="sum", fill_value=0)
+    return w.reindex(columns=months, fill_value=0).reset_index()
 
 
 def base_names() -> dict[str, str]:
@@ -184,9 +241,185 @@ if page == "Forecast":
     locs = sorted(D["locations"]["location"])
 
     c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-    base = c1.selectbox("Base SKU", bases, format_func=lambda b: f"{b} · {names[b]}")
+    base = c1.selectbox("Base SKU", [ALL] + bases, format_func=lambda b: "All base SKUs" if b == ALL else f"{b} · {names[b]}")
     group = c2.selectbox("Customer group", [ALL] + groups, format_func=lambda g: "All customers" if g == ALL else g)
     loc = c3.selectbox("Ship-from", [ALL] + locs, format_func=lambda l: "All locations" if l == ALL else l)
+
+    # ---------------------------------------------------------- all base SKUs at once
+    if base == ALL:
+        it = D["items"]
+        fam_of = it.groupby("base_sku")["family"].first().fillna("").to_dict()
+        fams = sorted({f for f in fam_of.values() if f})
+        fam = c4.selectbox("Family", ["All"] + fams, format_func=lambda f: "All families" if f == "All" else f)
+        in_bases = [b for b in bases if fam == "All" or fam_of.get(b) == fam]
+
+        def pick_all(df, col="base_sku"):
+            df = df[df[col].isin(in_bases)] if col == "base_sku" else df
+            if group != ALL:
+                df = df[df["customer_group"] == group]
+            if loc != ALL:
+                df = df[df["location"] == loc]
+            return df
+
+        ch = res.chains.set_index("base_sku")
+        hist, bfc, vfc, un = pick_all(res.hist), pick_all(res.base_fc), pick_all(res.version_fc), pick_all(res.unallocated)
+        roots = {ch.loc[b, "root_base"] for b in in_bases if b in ch.index and ch.loc[b, "source"] == "own"}
+        ser = pick_all(res.series[res.series["root_base"].isin(roots)], col="root_base")
+        bt_view = (pick_all(res.backtest[res.backtest["root_base"].isin(roots)], col="root_base")
+                   if res.backtest is not None else None)
+
+        n12 = bfc[bfc["month"].isin(res.fc_months[:12])]["qty"].sum()
+        l12 = hist[hist["month"].isin(res.hist_months[-12:])]["qty"].sum()
+        act = ser["act"].sum()
+        k1, k2, k3, k4 = st.columns(4)
+        for col, title, value, sub in [
+                (k1, "Forecast, next 12 months", fmt(n12) + " units",
+                 f"{(n12 / l12 - 1) * 100:+.1f}% vs last 12 months shipped ({fmt(l12)})" if l12 else ""),
+                (k2, "Backtest error (WAPE)", f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
+                 (f"{level_wape_text(bt_view)} · bias {ser['err'].sum() / act * 100:+.1f}% across {len(ser)} series")
+                 if act else ""),
+                (k3, "Base SKUs", fmt(len(in_bases)), f"{bfc['base_sku'].nunique()} with a forecast"),
+                (k4, "Unallocated", fmt(un["qty"].sum()) + " units",
+                 "forecast with no eligible version" if un["qty"].sum() else "every unit reaches a version")]:
+            col.caption(title)
+            col.markdown(f"#### {value}")
+            if sub:
+                col.caption(sub)
+
+        # chart: history and forecast stacked by family (or by base SKU inside one family)
+        by = "family" if fam == "All" else "base_sku"
+        plot = pd.concat([hist.groupby(["base_sku", "month"], as_index=False)["qty"].sum().assign(kind="Shipped"),
+                          bfc.groupby(["base_sku", "month"], as_index=False)["qty"].sum().assign(kind="Forecast")])
+        plot["family"] = plot["base_sku"].map(fam_of).replace("", "No family")
+        top = plot.groupby(by)["qty"].sum().sort_values(ascending=False).index.tolist()
+        keep = top[:7]
+        plot["stack"] = plot[by].where(plot[by].isin(keep), "Other")
+        plot = plot.groupby(["stack", "month", "kind"], as_index=False)["qty"].sum()
+        domain = keep + (["Other"] if len(top) > 7 else [])
+        months = res.hist_months + res.fc_months
+        lab = "timeFormat(datetime(parseInt(slice(datum.value,0,4)), parseInt(slice(datum.value,5,7))-1, 1), '%b %y')"
+        x = alt.X("month:N", sort=months, title=None, scale=alt.Scale(domain=months),
+                  axis=alt.Axis(values=[m for m in months if m[5:7] in ("01", "04", "07", "10")], labelAngle=0, labelExpr=lab))
+        band = alt.Chart(pd.DataFrame({"month": [res.fc_months[0]], "month2": [res.fc_months[-1]]})).mark_rect(
+            opacity=0.10, color="#2a78d6").encode(x=x, x2="month2:N")
+        bars = alt.Chart(plot).mark_bar().encode(
+            x=x, y=alt.Y("qty:Q", title="Units per month", stack="zero"),
+            color=alt.Color("stack:N", title="Family" if by == "family" else "Base SKU", legend=alt.Legend(orient="top"),
+                            scale=alt.Scale(domain=domain, range=SERIES[:len(keep)] + (["#9aa3a0"] if len(top) > 7 else []))),
+            opacity=alt.Opacity("kind:N", title=None, scale=alt.Scale(domain=["Shipped", "Forecast"], range=[1.0, 0.6]),
+                                legend=alt.Legend(orient="top")),
+            tooltip=[alt.Tooltip("month:N", title="Month"), alt.Tooltip("kind:N", title="Type"),
+                     alt.Tooltip("stack:N", title="Family" if by == "family" else "Base SKU"),
+                     alt.Tooltip("qty:Q", title="Units", format=",.0f")])
+        st.subheader("All base SKUs" + ("" if fam == "All" else f" · {fam}"))
+        st.caption("Monthly units, stacked by " + ("family" if by == "family" else "base SKU")
+                   + ". The shaded months are forecast. Hard transitions show under the base SKU live in each month.")
+        st.altair_chart((band + bars).properties(height=320), width="stretch")
+
+        # grid: one row per base SKU, optional version rows
+        st.subheader("Forecast by base SKU")
+        g0, g1, g2 = st.columns([3, 2, 2])
+        dims = g0.multiselect("Break down by", list(DIMS), default=[], placeholder="No breakdown: one row per base SKU",
+                              key="all_dims", help="Rows for each location, customer group and/or account. Accounts in a "
+                              "group share its forecast by their shipments over the last 12 months.")
+        show_versions = g1.checkbox("Show versions under each base SKU")
+        only_unalloc = g2.checkbox("Only base SKUs with unallocated forecast")
+        mlabels = [label(m) for m in res.fc_months]
+        bwide = bfc.pivot_table(index="base_sku", columns="month", values="qty", aggfunc="sum", fill_value=0)
+        bwide = bwide.reindex(columns=res.fc_months, fill_value=0)
+        vwide = vfc.pivot_table(index=["base_sku", "version_sku"], columns="month", values="qty", aggfunc="sum",
+                                fill_value=0).reindex(columns=res.fc_months, fill_value=0)
+        hist12 = hist[hist["month"].isin(res.hist_months[-12:])].groupby("base_sku")["qty"].sum()
+        un_b = un.groupby("base_sku")["qty"].sum()
+        sm = ser.groupby("root_base").agg(abs_err=("abs_err", "sum"), act=("act", "sum"))
+        top_model = ser.groupby("root_base")["model"].agg(lambda m: m.value_counts().index[0]) if len(ser) else pd.Series(dtype=str)
+        rows = []
+        for b in in_bases:
+            if only_unalloc and not un_b.get(b, 0):
+                continue
+            f = bwide.loc[b] if b in bwide.index else pd.Series(0, index=res.fc_months)
+            src = ch.loc[b, "source"] if b in ch.index else "own"
+            root = ch.loc[b, "root_base"] if b in ch.index else b
+            wape = (sm.loc[root, "abs_err"] / sm.loc[root, "act"] * 100) if root in sm.index and sm.loc[root, "act"] else None
+            n12b, l12b = float(f.iloc[:12].sum()), float(hist12.get(b, 0))
+            rows.append({"Item": b, "Description": names.get(b, ""), "Family": fam_of.get(b, ""),
+                         "Model": (top_model.get(root, "") if src == "own" else "L" + src[1:]),
+                         "WAPE %": wape if src == "own" else None,
+                         "Last 12 shipped": l12b, "Next 12 forecast": n12b,
+                         "Change %": (n12b / l12b - 1) * 100 if l12b else None,
+                         "Unallocated": float(un_b.get(b, 0)),
+                         **{ml: float(v) for ml, v in zip(mlabels, f.values)}, "Total": float(f.sum())})
+            if show_versions and b in vwide.index.get_level_values(0):
+                for v, vr in vwide.loc[b].iterrows():
+                    rows.append({"Item": f"    {v}", "Description": "", "Family": "", "Model": "", "WAPE %": None,
+                                 "Last 12 shipped": float(hist[(hist["base_sku"] == b) & (hist["version_sku"] == v) &
+                                                               hist["month"].isin(res.hist_months[-12:])]["qty"].sum()),
+                                 "Next 12 forecast": float(vr.iloc[:12].sum()), "Change %": None, "Unallocated": None,
+                                 **{ml: float(x) for ml, x in zip(mlabels, vr.values)}, "Total": float(vr.sum())})
+        if dims:
+            # One row per base SKU (and version) x the chosen dimensions
+            dimcols = [DIMS[d] for d in dims]
+            if "account" in dimcols:
+                ha_all, va_all, ua_all = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0)
+                hsrc, vsrc, usrc, anames = pick_all(ha_all), pick_all(va_all), pick_all(ua_all), account_names()
+                bsrc = pd.concat([vsrc, usrc])
+            else:
+                hsrc, vsrc, usrc, bsrc, anames = hist, vfc, un, bfc, {}
+            keep_b = [b for b in in_bases if not only_unalloc or un_b.get(b, 0)]
+            h12 = hsrc[hsrc["month"].isin(res.hist_months[-12:])]
+            levels = [("base_sku", bsrc, h12)]
+            if show_versions:
+                levels.append(("version_sku", vsrc, h12))
+            rows = []
+            for lvl, src, hh in levels:
+                keys = ["base_sku"] + (["version_sku"] if lvl == "version_sku" else []) + dimcols
+                f = breakdown_rows(src[src["base_sku"].isin(keep_b)], keys, res.fc_months) if len(src) else pd.DataFrame(columns=keys)
+                l12_ = hh.groupby(keys)["qty"].sum().rename("l12").reset_index() if len(hh) else pd.DataFrame(columns=keys + ["l12"])
+                f = f.merge(l12_, on=keys, how="left") if len(f) else f
+                for _, r_ in f.iterrows():
+                    vals = [float(r_[m]) for m in res.fc_months]
+                    l12v, n12v = float(r_.get("l12", 0) or 0), sum(vals[:12])
+                    row = {"Item": r_["base_sku"] if lvl == "base_sku" else f"    {r_['version_sku']}",
+                           "Description": names.get(r_["base_sku"], "") if lvl == "base_sku" else "",
+                           "Family": fam_of.get(r_["base_sku"], "") if lvl == "base_sku" else ""}
+                    for d, c in zip(dims, dimcols):
+                        row[d] = anames.get(r_[c], r_[c]) if c == "account" else r_[c]
+                    row.update({"Last 12 shipped": l12v, "Next 12 forecast": n12v,
+                                "Change %": (n12v / l12v - 1) * 100 if l12v else None,
+                                **dict(zip(mlabels, vals)), "Total": sum(vals),
+                                "_b": r_["base_sku"], "_v": "" if lvl == "base_sku" else r_["version_sku"]})
+                    rows.append(row)
+            grid = pd.DataFrame(rows)
+            if len(grid):
+                grid = grid.sort_values(["_b", "_v"] + dims, kind="stable").drop(columns=["_b", "_v"])
+        grid = pd.DataFrame(rows) if not dims else grid
+        if grid.empty:
+            st.info("No base SKUs match this selection.")
+            st.stop()
+        num = st.column_config.NumberColumn(format="localized")
+        st.dataframe(grid, hide_index=True, width="stretch", height=min(38 * (len(grid) + 1) + 3, 640),
+                     column_config={"Item": st.column_config.TextColumn(pinned=True),
+                                    **{d: st.column_config.TextColumn(pinned=True) for d in dims},
+                                    "WAPE %": st.column_config.NumberColumn(format="%.1f"),
+                                    "Change %": st.column_config.NumberColumn(format="%+.1f"),
+                                    "Last 12 shipped": num, "Next 12 forecast": num, "Unallocated": num, "Total": num,
+                                    **{ml: num for ml in mlabels}})
+        st.caption(("Model and WAPE show without a breakdown. " if dims else
+                    "WAPE is the backtest error of the series behind each base SKU; a new product shows the like item it "
+                    "borrows from. ") + "Change % compares the next 12 months with the last 12 shipped."
+                   + (" Accounts in a customer group share its forecast by their shipments over the last 12 months."
+                      if "Account" in dims else ""))
+        e1, e2, e3 = st.columns([3, 3, 3])
+        e1.download_button("Download this table (CSV)", grid.to_csv(index=False).encode(),
+                           file_name=f"forecast_all_base_skus_{info['when'][:10]}.csv", mime="text/csv")
+        if e3.button("Prepare forecast by version and account (CSV)"):
+            _, va_all, _ = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0)
+            e3.download_button("Download forecast by version and account", va_all.to_csv(index=False).encode(),
+                               file_name=f"forecast_by_account_{info['when'][:10]}.csv", mime="text/csv")
+        e2.download_button("Download all forecasts (Excel)", excel_export(info["when"]),
+                           file_name=f"forecast_{info['when'][:10]}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.stop()
     ss = D["split_settings"]
     cur = dict(zip(ss["base_sku"], ss["method"])).get(base, "recent")
     method = c4.selectbox(f"Version split for {base}", list(SPLIT_LABELS), index=list(SPLIT_LABELS).index(cur),
@@ -230,6 +463,7 @@ if page == "Forecast":
 
     hist, vfc, bfc, un = pick(res.hist), pick(res.version_fc), pick(res.base_fc), pick(res.unallocated)
     ser = pick(res.series, "root_base", [root])
+    bt_view = pick(res.backtest, "root_base", [root]) if res.backtest is not None else None
     months = res.hist_months + res.fc_months
 
     # ---- headline figures
@@ -246,8 +480,9 @@ if page == "Forecast":
     k1, k2, k3, k4 = st.columns(4)
     stat(k1, "Forecast, next 12 months", fmt(n12) + " units",
          f"{(n12 / l12 - 1) * 100:+.0f}% vs last 12 months shipped ({fmt(l12)})" if l12 else "New item, no shipments yet")
-    stat(k2, "Backtest error" + borrowed, f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
-         f"bias {ser['err'].sum() / act * 100:+.0f}% (positive = over-forecast)" if act else "Not enough history to backtest")
+    stat(k2, "Backtest error (WAPE)" + borrowed, f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
+         (f"{level_wape_text(bt_view)} · bias {ser['err'].sum() / act * 100:+.0f}% (positive = over-forecast)")
+         if act else "Not enough history to backtest")
     if len(ser):
         top = ser["model"].value_counts()
         stat(k3, "Model" + borrowed, top.index[0], f"chosen for {top.iloc[0]} of {len(ser)} series")
@@ -311,28 +546,65 @@ if page == "Forecast":
 
     # ---- grid
     st.subheader("Forecast grid")
+    dims = st.multiselect("Break down by", list(DIMS), default=[], placeholder="No breakdown: totals only",
+                          key="grid_dims", help="Adds rows for each location, customer group and/or account. "
+                          "Accounts in a group share its forecast by their shipments over the last 12 months.")
+    dimcols = [DIMS[d] for d in dims]
+    if "account" in dimcols:
+        _, va_all, ua_all = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0)
+        vsrc, usrc = pick(va_all), pick(ua_all)
+        anames = account_names()
+    else:
+        vsrc, usrc, anames = vfc, un, {}
+    mcols = [label(m) for m in res.fc_months]
     rows = []
 
-    def line(name, df):
-        s = df.groupby("month")["qty"].sum().reindex(res.fc_months, fill_value=0)
-        return {"Item": name, **{label(m): int(v) for m, v in s.items()}, "Total": int(s.sum())}
+    def line(name, df, dv=None):
+        s_ = df.groupby("month")["qty"].sum().reindex(res.fc_months, fill_value=0)
+        row = {"Item": name}
+        for d, c in zip(dims, dimcols):
+            row[d] = "All" if dv is None else (anames.get(dv[c], dv[c]) if c == "account" else dv[c])
+        return {**row, **{label(m): int(v) for m, v in s_.items()}, "Total": int(s_.sum())}
+
+    def split_lines(name, df):
+        if not dimcols or df.empty:
+            return []
+        out = []
+        for _, r_ in breakdown_rows(df, dimcols, res.fc_months).iterrows():
+            row = {"Item": name}
+            for d, c in zip(dims, dimcols):
+                row[d] = anames.get(r_[c], r_[c]) if c == "account" else r_[c]
+            vals = [int(r_[m]) for m in res.fc_months]
+            out.append({**row, **dict(zip(mcols, vals)), "Total": sum(vals)})
+        return out
 
     for b in sorted(chain, key=lambda b: b == root):
         bb, vv, uu = bfc[bfc["base_sku"] == b], vfc[vfc["base_sku"] == b], un[un["base_sku"] == b]
         rows.append(line(f"{b} base SKU forecast", bb))
+        rows += split_lines(f"{b} base SKU forecast", pd.concat([vsrc[vsrc["base_sku"] == b], usrc[usrc["base_sku"] == b]]))
         for v in [v for v in versions if v in set(it.loc[it["base_sku"] == b, "version_sku"])]:
             rows.append(line(f"    {v}", vv[vv["version_sku"] == v]))
+            rows += split_lines(f"    {v}", vsrc[(vsrc["base_sku"] == b) & (vsrc["version_sku"] == v)])
         if len(uu):
             rows.append(line("    Unallocated", uu))
+            rows += split_lines("    Unallocated", usrc[usrc["base_sku"] == b])
         diff = line("    Check: base minus versions", bb)
         alloc = line("", pd.concat([vv, uu]))
-        rows.append({k: (v if k == "Item" else v - alloc[k]) for k, v in diff.items()})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+        rows.append({k: (v if k in ["Item"] + dims else v - alloc[k]) for k, v in diff.items()})
+    grid = pd.DataFrame(rows)
+    st.dataframe(grid, hide_index=True, width="stretch", height=min(38 * (len(grid) + 1) + 3, 640),
                  column_config={"Item": st.column_config.TextColumn(pinned=True),
+                                **{d: st.column_config.TextColumn(pinned=True) for d in dims},
                                 **{label(m): st.column_config.NumberColumn(format="localized") for m in res.fc_months},
                                 "Total": st.column_config.NumberColumn(format="localized")})
+    if dimcols:
+        st.caption("\"All\" rows are totals; the rows after them break the same figures down. "
+                   + ("Accounts in a customer group share its forecast by their shipments over the last 12 months."
+                      if "account" in dimcols else ""))
 
-    e1, e2, _ = st.columns([3, 3, 3])
+    e0, e1, e2 = st.columns([3, 3, 3])
+    e0.download_button("Download this table (CSV)", grid.to_csv(index=False).encode(),
+                       file_name=f"forecast_{base}_{info['when'][:10]}.csv", mime="text/csv")
     e1.download_button("Download all forecasts (Excel)", excel_export(info["when"]),
                        file_name=f"forecast_{info['when'][:10]}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -696,28 +968,68 @@ elif page == "Master data":
 elif page == "Accuracy":
     st.header("Backtest accuracy")
     s = res.series[res.series["act"] > 0]
+    bt = res.backtest
     holdout = int(info["config"].get("holdout", DEFAULTS["holdout"]))
-    st.caption(f"Each series was fitted without its last {holdout} months, then scored against them. "
-               "WAPE is total absolute error over total shipments. Hard-transition chains are listed under the successor base SKU.")
+    st.caption(f"Each series (base SKU x customer group x location) was forecast for its last {holdout} months without "
+               "seeing them. WAPE = total absolute error / total shipments; bias = total error / total shipments "
+               "(positive = over-forecast). For coarser levels, forecasts and actuals are added together to that level "
+               "for each month before comparing, so errors in the pieces cancel as they would in a report. "
+               "Hard-transition chains are listed under the successor base SKU.")
     if s.empty:
         st.info("No series has enough history to backtest.")
+    elif bt is None:
+        st.info("This forecast was run before error by level was added. Press Run forecast to see it.")
     else:
-        def pct_table(col):
-            g = s.groupby(["root_base", "customer_group"])[[col, "act"]].sum()
-            p = (g[col] / g["act"] * 100).unstack("customer_group")
-            tot = s.groupby("root_base")[[col, "act"]].sum()
-            p["All customers"] = tot[col] / tot["act"] * 100
-            p.index.name = "Base SKU"
-            return p
+        fams = D["items"].groupby("base_sku")["family"].first().fillna("").to_dict()
+        f1, f2, _ = st.columns([2, 2, 3])
+        fam_list = sorted({fams.get(b, "") for b in bt["root_base"].unique()} - {""})
+        fam = f1.selectbox("Family", ["All"] + fam_list, format_func=lambda f: "All families" if f == "All" else f)
+        loc = f2.selectbox("Ship-from", ["All"] + sorted(bt["location"].unique()),
+                           format_func=lambda l: "All locations" if l == "All" else l)
+        v = bt
+        if fam != "All":
+            v = v[v["root_base"].map(fams) == fam]
+        if loc != "All":
+            v = v[v["location"] == loc]
 
-        a1, a2, a3 = st.columns(3)
-        a1.metric("Overall WAPE", f"{s['abs_err'].sum() / s['act'].sum() * 100:.1f}%")
-        a2.metric("Overall bias", f"{s['err'].sum() / s['act'].sum() * 100:+.1f}%", help="Positive means over-forecast")
-        a3.metric("Series backtested", fmt(len(s)))
-        st.subheader("WAPE by base SKU and customer group, %")
-        st.dataframe(pct_table("abs_err").style.format("{:.0f}", na_rep=""), width="stretch")
-        st.subheader("Bias by base SKU and customer group, %")
-        st.dataframe(pct_table("err").style.format("{:+.0f}", na_rep=""), width="stretch")
+        st.subheader("Error by level")
+        lv = accuracy.by_level(v)
+        cols = st.columns(len(lv))
+        for col, r_ in zip(cols, lv.itertuples()):
+            col.caption(r_.level)
+            col.markdown(f"#### {r_.wape:.1f}% WAPE" if r_.wape == r_.wape else "#### n/a")
+            col.caption(f"bias {r_.bias:+.1f}%" if r_.bias == r_.bias else "")
+        st.caption(f"{v[['root_base', 'customer_group', 'location']].drop_duplicates().shape[0]:,} series, "
+                   f"{fmt(v['act'].sum())} units shipped in the test months. Error falls at coarser levels because "
+                   "over- and under-forecasts in the pieces cancel.")
+
+        st.subheader("By base SKU")
+        st.caption("Base SKU = all customers and locations added together. Each customer group column = that base SKU "
+                   "for that group, locations added together.")
+        base = accuracy.by_key(v, ["root_base"], ["root_base"])
+        grp = accuracy.by_key(v, ["root_base", "customer_group"], ["root_base", "customer_group"])["wape"].unstack()
+        tb = pd.concat([base["act"].rename("Units in test"), base["wape"].rename("Base SKU WAPE %"),
+                        base["bias"].rename("Base SKU bias %"), grp], axis=1).sort_values("Units in test", ascending=False)
+        tb.index.name = "Base SKU"
+        st.dataframe(tb, width="stretch", height=min(38 * (len(tb) + 1) + 3, 520),
+                     column_config={"Units in test": st.column_config.NumberColumn(format="localized"),
+                                    **{c: st.column_config.NumberColumn(format="%.1f") for c in tb.columns if c != "Units in test"}})
+
+        st.subheader("By customer group")
+        st.caption("All items: the group's total across every item, the coarsest view. Item level: each base SKU for "
+                   "the group, then added up, which is the level planners usually review.")
+        tot = accuracy.by_key(v, ["customer_group"], ["customer_group"])
+        itm = accuracy.by_key(v, ["customer_group"], ["root_base", "customer_group"])
+        rows = pd.DataFrame({"Customer group": tot.index, "Units in test": tot["act"].values,
+                             "WAPE %, all items": tot["wape"].values, "WAPE %, item level": itm["wape"].reindex(tot.index).values,
+                             "Bias %": itm["bias"].reindex(tot.index).values})
+        cg = rows.sort_values("Units in test", ascending=False)
+        st.dataframe(cg, hide_index=True, width="stretch",
+                     column_config={"Units in test": st.column_config.NumberColumn(format="localized"),
+                                    "WAPE %, all items": st.column_config.NumberColumn(format="%.1f"),
+                                    "WAPE %, item level": st.column_config.NumberColumn(format="%.1f"),
+                                    "Bias %": st.column_config.NumberColumn(format="%+.1f")})
+
         st.subheader("Models chosen")
         mc = res.series["model"].value_counts().rename_axis("Model").reset_index(name="Series")
         st.dataframe(mc, hide_index=True)
@@ -846,6 +1158,13 @@ elif page == "Data":
                                        for r in reversed(log)]), hide_index=True)
 
     st.subheader("Sample data and reset")
+    if demo.available():
+        st.write("Replace everything with the demo dataset: M5 Walmart food and household products (1,000 products, "
+                 "10 stores as customers, 3 state DCs, Feb 2021 to May 2026) with a generated lifecycle layer.")
+        sure_d = st.checkbox("Yes, replace what is loaded with the demo dataset", key="sure_demo", value=D["items"].empty)
+        if st.button("Load demo dataset", disabled=not sure_d):
+            load_demo()
+            st.rerun()
     s1, s2 = st.columns(2)
     with s1:
         st.write("Replace everything with the sample range (6 base SKUs, 8 customers, 3 locations, 36 months).")

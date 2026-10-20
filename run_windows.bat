@@ -8,6 +8,8 @@ if not exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m pip install --upgrade pip
   ".venv\Scripts\python.exe" -m pip install -r requirements.txt || goto :piperror
 )
+echo Checking packages...
+".venv\Scripts\python.exe" -m pip install -q -r requirements.txt || goto :piperror
 echo Starting. Your browser will open at http://localhost:8501
 echo Keep this window open while you use the app. Close it to stop.
 start "" /b cmd /c "timeout /t 5 >nul & start http://localhost:8501"

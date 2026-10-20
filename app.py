@@ -11,17 +11,19 @@ import streamlit as st
 
 import importlib
 
-from planner import accuracy, breakdown, dataio, db, demo, engine, explore, sample
+from planner import accuracy, breakdown, dataio, db, demo, engine, explore, sample, style
 
 # Pick up edits to the planner package without restarting the app.
-for _m in (engine, db, dataio, explore, breakdown, sample, demo, accuracy):
+for _m in (engine, db, dataio, explore, breakdown, sample, demo, accuracy, style):
     importlib.reload(_m)
 from planner.engine import ALL, DEFAULTS, run_forecast  # noqa: E402
 
-st.set_page_config(page_title="Base SKU Demand Planner", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Demand Predictor", layout="wide", initial_sidebar_state="expanded")
 
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
-STATUS_COLORS = {"Discontinued": "#9aa3a0", "Active": "#2a78d6", "Phasing out": "#eda100", "New": "#1baf7a"}
+SERIES = style.SERIES
+NEUTRAL = style.NEUTRAL
+STATUS_COLORS = {"Discontinued": style.NEUTRAL, "Active": style.SERIES[2], "Phasing out": style.SERIES[1], "New": style.SERIES[0]}
+st.markdown(style.CSS, unsafe_allow_html=True)
 SPLIT_LABELS = {"recent": "Recent shipment mix", "equal": "Equal split", "manual": "Manual percentages"}
 MONTH_RE = r"^\d{4}-(0[1-9]|1[0-2])$"
 
@@ -106,7 +108,7 @@ def save(table: str, df: pd.DataFrame, msg: str = "Saved. Run the forecast to ap
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
-    st.title("Base SKU Demand Planner")
+    st.markdown(style.wordmark(), unsafe_allow_html=True)
     page = st.radio("Go to", ["Forecast", "Explore", "Lifecycle", "Master data", "Accuracy", "Data"], label_visibility="collapsed")
     st.divider()
     info = db.get_setting("run_info")
@@ -145,15 +147,13 @@ with st.sidebar:
                                "nonkey_by_channel": by_ch, "drop_last_month": drop})
                 st.rerun()
 
-# ------------------------------------------------------------------ banner (every page)
-st.markdown(
-    """
-    <div style="background:#0b6e5f;color:#ffffff;border-radius:8px;padding:14px 20px;margin-bottom:12px;">
-      <div style="font-size:1.35rem;font-weight:600;line-height:1.3;">Welcome to Demand Predictor</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# ------------------------------------------------------------------ masthead (every page)
+_ctx = []
+if info:
+    _ctx.append(("Last forecast", info["when"][:16]))
+if demo.is_demo_mode() or db.get_setting("dataset") == "demo-m5":
+    _ctx.append(("Data", "Public demo (M5)"))
+st.markdown(style.masthead("Welcome to Demand Predictor", _ctx), unsafe_allow_html=True)
 if demo.is_demo_mode() or db.get_setting("dataset") == "demo-m5":
     st.caption(demo.NOTE + " See DEMO_DATA.md in the app folder.")
 
@@ -271,20 +271,16 @@ if page == "Forecast":
         n12 = bfc[bfc["month"].isin(res.fc_months[:12])]["qty"].sum()
         l12 = hist[hist["month"].isin(res.hist_months[-12:])]["qty"].sum()
         act = ser["act"].sum()
-        k1, k2, k3, k4 = st.columns(4)
-        for col, title, value, sub in [
-                (k1, "Forecast, next 12 months", fmt(n12) + " units",
+        st.markdown(style.kpis([
+                ("Forecast, next 12 months", fmt(n12) + " units",
                  f"{(n12 / l12 - 1) * 100:+.1f}% vs last 12 months shipped ({fmt(l12)})" if l12 else ""),
-                (k2, "Backtest error (WAPE)", f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
+                ("Backtest error (WAPE)", f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
                  (f"{level_wape_text(bt_view)} · bias {ser['err'].sum() / act * 100:+.1f}% across {len(ser)} series")
                  if act else ""),
-                (k3, "Base SKUs", fmt(len(in_bases)), f"{bfc['base_sku'].nunique()} with a forecast"),
-                (k4, "Unallocated", fmt(un["qty"].sum()) + " units",
-                 "forecast with no eligible version" if un["qty"].sum() else "every unit reaches a version")]:
-            col.caption(title)
-            col.markdown(f"#### {value}")
-            if sub:
-                col.caption(sub)
+                ("Base SKUs", fmt(len(in_bases)), f"{bfc['base_sku'].nunique()} with a forecast"),
+                ("Unallocated", fmt(un["qty"].sum()) + " units",
+                 "forecast with no eligible version" if un["qty"].sum() else "every unit reaches a version")]),
+            unsafe_allow_html=True)
 
         # chart: history and forecast stacked by family (or by base SKU inside one family)
         by = "family" if fam == "All" else "base_sku"
@@ -301,11 +297,11 @@ if page == "Forecast":
         x = alt.X("month:N", sort=months, title=None, scale=alt.Scale(domain=months),
                   axis=alt.Axis(values=[m for m in months if m[5:7] in ("01", "04", "07", "10")], labelAngle=0, labelExpr=lab))
         band = alt.Chart(pd.DataFrame({"month": [res.fc_months[0]], "month2": [res.fc_months[-1]]})).mark_rect(
-            opacity=0.10, color="#2a78d6").encode(x=x, x2="month2:N")
+            opacity=0.12, color=style.FORECAST_BAND).encode(x=x, x2="month2:N")
         bars = alt.Chart(plot).mark_bar().encode(
             x=x, y=alt.Y("qty:Q", title="Units per month", stack="zero"),
             color=alt.Color("stack:N", title="Family" if by == "family" else "Base SKU", legend=alt.Legend(orient="top"),
-                            scale=alt.Scale(domain=domain, range=SERIES[:len(keep)] + (["#9aa3a0"] if len(top) > 7 else []))),
+                            scale=alt.Scale(domain=domain, range=SERIES[:len(keep)] + ([NEUTRAL] if len(top) > 7 else []))),
             opacity=alt.Opacity("kind:N", title=None, scale=alt.Scale(domain=["Shipped", "Forecast"], range=[1.0, 0.6]),
                                 legend=alt.Legend(orient="top")),
             tooltip=[alt.Tooltip("month:N", title="Month"), alt.Tooltip("kind:N", title="Type"),
@@ -471,27 +467,26 @@ if page == "Forecast":
     l12 = hist[hist["month"].isin(res.hist_months[-12:])]["qty"].sum()
     act = ser["act"].sum()
     borrowed = f" (from {root})" if root != base else ""
-    def stat(col, title, value, sub=""):
-        col.caption(title)
-        col.markdown(f"#### {value}")
-        if sub:
-            col.caption(sub)
+    figs = []
 
-    k1, k2, k3, k4 = st.columns(4)
-    stat(k1, "Forecast, next 12 months", fmt(n12) + " units",
+    def stat(title, value, sub=""):
+        figs.append((title, str(value), sub))
+
+    stat("Forecast, next 12 months", fmt(n12) + " units",
          f"{(n12 / l12 - 1) * 100:+.0f}% vs last 12 months shipped ({fmt(l12)})" if l12 else "New item, no shipments yet")
-    stat(k2, "Backtest error (WAPE)" + borrowed, f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
+    stat("Backtest error (WAPE)" + borrowed, f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
          (f"{level_wape_text(bt_view)} · bias {ser['err'].sum() / act * 100:+.0f}% (positive = over-forecast)")
          if act else "Not enough history to backtest")
     if len(ser):
         top = ser["model"].value_counts()
-        stat(k3, "Model" + borrowed, top.index[0], f"chosen for {top.iloc[0]} of {len(ser)} series")
+        stat("Model" + borrowed, top.index[0], f"chosen for {top.iloc[0]} of {len(ser)} series")
     src_hist = pick(res.hist, in_bases=[b for b in ch.index if ch.loc[b, "root_base"] == root and ch.loc[b, "source"] == "own"])
     if len(src_hist):
         mm = src_hist["month"].str[5:7]
         cal = src_hist.groupby(mm)["qty"].sum() / src_hist.groupby(mm)["month"].nunique()
-        stat(k4, "Seasonal peak" + borrowed, dt.date(2000, int(cal.idxmax()), 1).strftime("%B"),
+        stat("Seasonal peak" + borrowed, dt.date(2000, int(cal.idxmax()), 1).strftime("%B"),
              f"{cal.max() / cal.mean():.2f}x an average month")
+    st.markdown(style.kpis(figs), unsafe_allow_html=True)
 
     # ---- chart: history and forecast stacked by version
     plot = pd.concat([hist.groupby(["version_sku", "month"], as_index=False)["qty"].sum().assign(kind="Shipped"),
@@ -500,12 +495,12 @@ if page == "Forecast":
     plot["label"] = plot["month"].map(label)
     plot["order"] = plot["version_sku"].map({v: i for i, v in enumerate(versions + ["Unallocated"])})
     shown = [v for v in versions if v in set(plot["version_sku"])] + (["Unallocated"] if len(un) else [])
-    colors = [SERIES[versions.index(v) % len(SERIES)] if v in versions else "#9aa3a0" for v in shown]
+    colors = [SERIES[versions.index(v) % len(SERIES)] if v in versions else NEUTRAL for v in shown]
     lab = "timeFormat(datetime(parseInt(slice(datum.value,0,4)), parseInt(slice(datum.value,5,7))-1, 1), '%b %y')"
     x = alt.X("month:N", sort=months, title=None, scale=alt.Scale(domain=months),
               axis=alt.Axis(values=[m for m in months if m[5:7] in ("01", "04", "07", "10")], labelAngle=0, labelExpr=lab))
     band = alt.Chart(pd.DataFrame({"month": [res.fc_months[0]], "month2": [res.fc_months[-1]]})).mark_rect(
-        opacity=0.10, color="#2a78d6").encode(x=x, x2="month2:N")
+        opacity=0.12, color=style.FORECAST_BAND).encode(x=x, x2="month2:N")
     bars = alt.Chart(plot).mark_bar(cornerRadiusTopLeft=1, cornerRadiusTopRight=1).encode(
         x=x, y=alt.Y("qty:Q", title="Units per month", stack="zero"),
         color=alt.Color("version_sku:N", title="Version", scale=alt.Scale(domain=shown, range=colors),
@@ -613,8 +608,8 @@ if page == "Forecast":
 
 # ------------------------------------------------------------------ Explore
 elif page == "Explore":
-    PATTERN_COLORS = {"Smooth": "#2a78d6", "Erratic": "#eb6834", "Intermittent": "#1baf7a", "Lumpy": "#eda100",
-                      "Too short": "#9aa3a0"}
+    PATTERN_COLORS = {"Smooth": SERIES[0], "Erratic": SERIES[1], "Intermittent": SERIES[2], "Lumpy": SERIES[3],
+                      "Too short": NEUTRAL}
     st.header("Explore data")
     st.caption("A profile of the shipments loaded now, before any forecast: data problems, demand patterns, trend, "
                "seasonality and outliers, with suggested changes to settings and master data.")
@@ -679,11 +674,11 @@ elif page == "Explore":
     tx = alt.X("month:N", sort=months, title=None, axis=alt.Axis(
         values=[m for m in months if m[5:7] in ("01", "04", "07", "10")], labelAngle=0,
         labelExpr="timeFormat(datetime(parseInt(slice(datum.value,0,4)), parseInt(slice(datum.value,5,7))-1, 1), '%b %y')"))
-    tbars = alt.Chart(tdf).mark_bar(color="#9ec5f4").encode(
+    tbars = alt.Chart(tdf).mark_bar(color=style.NEUTRAL_LIGHT).encode(
         x=tx, y=alt.Y("qty:Q", title="Units per month"),
         tooltip=[alt.Tooltip("month:N", title="Month"), alt.Tooltip("qty:Q", title="Units", format=",.0f"),
                  alt.Tooltip("avg12:Q", title="12-month average", format=",.0f")])
-    tline = alt.Chart(tdf.dropna()).mark_line(color="#1c5cab", strokeWidth=2).encode(x=tx, y="avg12:Q")
+    tline = alt.Chart(tdf.dropna()).mark_line(color=style.SPRUCE, strokeWidth=2).encode(x=tx, y="avg12:Q")
     st.caption("Total monthly shipments for the selection. The line is the 12-month moving average: its slope is the underlying trend.")
     st.altair_chart((tbars + tline).properties(height=220), width="stretch")
 
@@ -723,8 +718,8 @@ elif page == "Explore":
         tooltip=[alt.Tooltip("label:N", title="Series"), alt.Tooltip("pattern:N", title="Pattern"),
                  alt.Tooltip("adi:Q", title="ADI", format=".2f"), alt.Tooltip("cv2:Q", title="CV²", format=".2f"),
                  alt.Tooltip("last12:Q", title="Last 12 months", format=",.0f")])
-    cuts = alt.Chart(pd.DataFrame({"v": [explore.ADI_CUT]})).mark_rule(strokeDash=[4, 3], color="#888").encode(x="v:Q") + \
-        alt.Chart(pd.DataFrame({"h": [explore.CV2_CUT]})).mark_rule(strokeDash=[4, 3], color="#888").encode(y="h:Q")
+    cuts = alt.Chart(pd.DataFrame({"v": [explore.ADI_CUT]})).mark_rule(strokeDash=[4, 3], color=style.SLATE).encode(x="v:Q") + \
+        alt.Chart(pd.DataFrame({"h": [explore.CV2_CUT]})).mark_rule(strokeDash=[4, 3], color=style.SLATE).encode(y="h:Q")
     pc1.altair_chart((cuts + pts).properties(height=320), width="stretch")
     ps = explore.pattern_summary(view)
     pc2.markdown("**Series and volume by pattern**")
@@ -749,7 +744,7 @@ elif page == "Explore":
         y=alt.Y("trend:N", sort=["Down", "Flat", "Up", "Too short"], title=None),
         x=alt.X("share:Q", title="Share of last-12-month volume", axis=alt.Axis(format="%")),
         color=alt.Color("trend:N", legend=None, scale=alt.Scale(domain=["Down", "Flat", "Up", "Too short"],
-                                                               range=["#e34948", "#9aa3a0", "#1baf7a", "#cfd4d2"])),
+                                                               range=[style.BAD, NEUTRAL, style.GOOD, style.NEUTRAL_LIGHT])),
         tooltip=[alt.Tooltip("trend:N", title="Trend"), alt.Tooltip("share:Q", title="Share", format=".0%")]
     ).properties(height=170), width="stretch")
     pk = act[act["peak_month"] != ""].copy()
@@ -760,7 +755,7 @@ elif page == "Explore":
         x=alt.X("peak_month:N", sort=explore.MONTHS, title=None, scale=alt.Scale(domain=explore.MONTHS)),
         y=alt.Y("sum(last12):Q", title="Last 12 months, units"),
         color=alt.Color("seasonal:N", title=None, legend=alt.Legend(orient="top"),
-                        scale=alt.Scale(domain=["Clearly seasonal", "Weak or none"], range=["#2a78d6", "#cfd4d2"])),
+                        scale=alt.Scale(domain=["Clearly seasonal", "Weak or none"], range=[SERIES[0], style.NEUTRAL_LIGHT])),
         tooltip=[alt.Tooltip("peak_month:N", title="Peak"), alt.Tooltip("seasonal:N", title="Seasonality"),
                  alt.Tooltip("sum(last12):Q", title="Units", format=",.0f")]).properties(height=170), width="stretch")
 
@@ -822,24 +817,24 @@ elif page == "Explore":
     sx = alt.X("month:N", sort=months[st0:], title=None, axis=alt.Axis(
         values=[m for m in months[st0:] if m[5:7] in ("01", "04", "07", "10")], labelAngle=0,
         labelExpr="timeFormat(datetime(parseInt(slice(datum.value,0,4)), parseInt(slice(datum.value,5,7))-1, 1), '%b %y')"))
-    base_line = alt.Chart(sdf).mark_line(color="#2a78d6", strokeWidth=2, point=alt.OverlayMarkDef(size=25, color="#2a78d6")).encode(
+    base_line = alt.Chart(sdf).mark_line(color=style.SPRUCE, strokeWidth=2, point=alt.OverlayMarkDef(size=25, color=style.SPRUCE)).encode(
         x=sx, y=alt.Y("qty:Q", title="Units per month"),
         tooltip=[alt.Tooltip("month:N", title="Month"), alt.Tooltip("qty:Q", title="Units", format=",.0f")])
     layers = base_line
     if "trend" in sdf:
-        layers += alt.Chart(sdf.dropna(subset=["trend"])).mark_line(strokeDash=[5, 4], color="#6b7280").encode(
+        layers += alt.Chart(sdf.dropna(subset=["trend"])).mark_line(strokeDash=[5, 4], color=style.SLATE).encode(
             x=sx, y="trend:Q", tooltip=[alt.Tooltip("trend:Q", title="Trend level (deseasonalised)", format=",.0f")])
     if sdf["outlier"].any():
         layers += alt.Chart(sdf[sdf["outlier"]]).mark_point(size=160, shape="circle", filled=False, strokeWidth=2.5,
-                                                            color="#e34948").encode(
+                                                            color=style.BAD).encode(
             x=sx, y="qty:Q", tooltip=[alt.Tooltip("month:N", title="Outlier"), alt.Tooltip("qty:Q", title="Units", format=",.0f")])
     d1, d2 = st.columns([3, 1])
     d1.altair_chart(layers.properties(height=280), width="stretch")
-    d1.caption("Blue: monthly shipments. Dashed: straight-line trend of the deseasonalised level over the last 36 months. "
+    d1.caption("Green line: monthly shipments. Dashed: straight-line trend of the deseasonalised level over the last 36 months. "
                "Red rings: outliers (more than 3.5 robust standard deviations and 25% away from the months around them).")
     if a["months_active"] >= 24:
         sidx = pd.DataFrame({"month": explore.MONTHS, "index": a["indices"]})
-        d2.altair_chart(alt.Chart(sidx).mark_bar(cornerRadiusEnd=2, color="#2a78d6").encode(
+        d2.altair_chart(alt.Chart(sidx).mark_bar(cornerRadiusEnd=2, color=SERIES[0]).encode(
             x=alt.X("index:Q", title="Seasonal index (1 = average)"), y=alt.Y("month:N", sort=explore.MONTHS, title=None),
             tooltip=[alt.Tooltip("month:N"), alt.Tooltip("index:Q", format=".2f")]).properties(height=280), width="stretch")
     else:
@@ -994,11 +989,9 @@ elif page == "Accuracy":
 
         st.subheader("Error by level")
         lv = accuracy.by_level(v)
-        cols = st.columns(len(lv))
-        for col, r_ in zip(cols, lv.itertuples()):
-            col.caption(r_.level)
-            col.markdown(f"#### {r_.wape:.1f}% WAPE" if r_.wape == r_.wape else "#### n/a")
-            col.caption(f"bias {r_.bias:+.1f}%" if r_.bias == r_.bias else "")
+        st.markdown(style.kpis([(r_.level, f"{r_.wape:.1f}% WAPE" if r_.wape == r_.wape else "n/a",
+                                 f"bias {r_.bias:+.1f}%" if r_.bias == r_.bias else "") for r_ in lv.itertuples()]),
+                    unsafe_allow_html=True)
         st.caption(f"{v[['root_base', 'customer_group', 'location']].drop_duplicates().shape[0]:,} series, "
                    f"{fmt(v['act'].sum())} units shipped in the test months. Error falls at coarser levels because "
                    "over- and under-forecasts in the pieces cancel.")

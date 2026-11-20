@@ -11,10 +11,10 @@ import streamlit as st
 
 import importlib
 
-from planner import accuracy, breakdown, dataio, db, demo, engine, explore, sample, style
+from planner import accuracy, breakdown, dataio, db, demo, engine, explore, hosted, overrides, performance, sample, style
 
 # Pick up edits to the planner package without restarting the app.
-for _m in (engine, db, dataio, explore, breakdown, sample, demo, accuracy, style):
+for _m in (engine, db, dataio, explore, breakdown, sample, demo, accuracy, style, overrides, performance, hosted):
     importlib.reload(_m)
 from planner.engine import ALL, DEFAULTS, run_forecast  # noqa: E402
 
@@ -43,14 +43,18 @@ def load_inputs(version: int) -> dict[str, pd.DataFrame]:
 
 
 @st.cache_data(show_spinner=False)
-def load_result(when: str | None):
-    return db.load_result()
+def load_result(when: str | None, ov_version: int = 0):
+    """The last run with planner overrides applied (final forecast); res.stat_base_fc keeps the stat numbers."""
+    r, inf = db.load_result()
+    if r is None:
+        return None, None
+    return overrides.apply(r, overrides.read()), inf
 
 
 @st.cache_data(show_spinner=False)
-def excel_export(when: str) -> bytes:
-    res, _ = db.load_result()
-    return dataio.export_excel(res, db.read("items"))
+def excel_export(when: str, ov_version: int = 0) -> bytes:
+    res, _ = load_result(when, ov_version)
+    return dataio.export_excel(res, db.read("items"), overrides.log(overrides.read(), res.measures, res.fc_months))
 
 
 def inputs() -> dict[str, pd.DataFrame]:
@@ -59,7 +63,13 @@ def inputs() -> dict[str, pd.DataFrame]:
 
 def result():
     info = db.get_setting("run_info")
-    return load_result(info["when"] if info else None)
+    return load_result(info["when"] if info else None, overrides.version())
+
+
+def save_live_snapshot(stat_base_fc: pd.DataFrame, fc_months: list[str]) -> None:
+    """Keep this cycle's stat and final forecast for the Performance page (refreshed on every override save)."""
+    m = overrides.measures(stat_base_fc, overrides.read(), fc_months)
+    performance.save(fc_months[0], "live", m)
 
 
 def do_run() -> bool:
@@ -79,6 +89,7 @@ def do_run() -> bool:
         st.error(str(e))
         return False
     db.save_result(res, cfg, dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    save_live_snapshot(res.base_fc, res.fc_months)
     db.set_setting("last_run_seconds", round(time.time() - t_start, 1))
     db.set_setting("last_run_workers", engine.LAST_RUN["workers"])
     bar.empty()
@@ -100,16 +111,43 @@ def load_sample():
     do_run()
 
 
+@st.cache_data(show_spinner="Preparing the workbook...")
+def current_workbook(version: int) -> bytes:
+    """Everything loaded, as one workbook; built once per change to the inputs."""
+    return dataio.current_data_workbook(inputs())
+
+
 def save(table: str, df: pd.DataFrame, msg: str = "Saved. Run the forecast to apply the change."):
     db.write(table, df)
     st.session_state["flash"] = msg
     st.rerun()
 
 
+# ------------------------------------------------------------------ hosted demo: set up once, then lock
+LOCKED = hosted.is_hosted()
+
+
+@st.cache_resource(show_spinner=False)
+def hosted_setup(db_path: str):
+    """Runs once per server process; other sessions wait for it instead of starting a second setup."""
+    if not hosted.ready():
+        hosted.setup(run_forecast)
+        st.cache_data.clear()
+    return True
+
+
+if LOCKED and not hosted.ready():
+    st.markdown(style.CSS, unsafe_allow_html=True)
+    with st.spinner("Setting up the demo: loading the data and running the first forecast. This takes a minute or "
+                    "two the first time the app starts..."):
+        hosted_setup(str(db.DB_PATH))
+elif LOCKED:
+    hosted_setup(str(db.DB_PATH))
+
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.markdown(style.wordmark(), unsafe_allow_html=True)
-    page = st.radio("Go to", ["Forecast", "Explore", "Lifecycle", "Master data", "Accuracy", "Data"], label_visibility="collapsed")
+    page = st.radio("Go to", ["Forecast", "Explore", "Lifecycle", "Master data", "Accuracy", "Performance", "Data"], label_visibility="collapsed")
     st.divider()
     info = db.get_setting("run_info")
     if st.button("Run forecast", type="primary", width="stretch"):
@@ -125,27 +163,43 @@ with st.sidebar:
         st.caption("No forecast has been run yet.")
     with st.expander("Settings"):
         cfg = db.get_config()
-        with st.form("settings"):
-            horizon = st.number_input("Forecast horizon, months", 3, 36, int(cfg["horizon"]))
-            seasonal = st.checkbox("Use seasonal models", bool(cfg["seasonal"]))
-            arima_on = st.checkbox("Use ARIMA and SARIMA models", bool(cfg["arima"]),
-                                   help="Adds ARIMA and SARIMA to the models each series tries. About 1 second "
-                                        "more per series; turn off for very large runs.",
-                                   disabled=not engine.HAS_STATSMODELS)
-            workers = st.number_input("Worker processes for ARIMA (0 = automatic)", 0, 64, int(cfg.get("workers", 0)),
-                                      help=f"Automatic uses {engine.worker_count({'workers': 0})} on this computer. "
-                                           f"Used when there are {engine.PARALLEL_MIN_SERIES}+ series.")
-            holdout = st.number_input("Backtest holdout, months", 3, 12, int(cfg["holdout"]))
-            recent = st.number_input("Recent-mix window, months", 1, 24, int(cfg["recent_window"]))
-            npi_m = st.number_input("New item borrows until it has this many months of its own history", 1, 24,
-                                    int(cfg["npi_own_history_months"]))
-            by_ch = st.checkbox("Pool non-key customers by channel", bool(cfg["nonkey_by_channel"]))
-            drop = st.checkbox("Ignore the latest month (incomplete)", bool(cfg["drop_last_month"]))
-            if st.form_submit_button("Save settings"):
-                db.set_config({**cfg, "horizon": int(horizon), "seasonal": seasonal, "holdout": int(holdout),
-                               "recent_window": int(recent), "arima": bool(arima_on), "workers": int(workers), "npi_own_history_months": int(npi_m),
-                               "nonkey_by_channel": by_ch, "drop_last_month": drop})
-                st.rerun()
+        if LOCKED:
+            st.caption("Settings are fixed in this demo copy.")
+            st.write(f"Horizon {cfg['horizon']} months · seasonal models {'on' if cfg['seasonal'] else 'off'} · ARIMA "
+                     f"{'on' if cfg['arima'] else 'off'} · holdout {cfg['holdout']} months · recent-mix window "
+                     f"{cfg['recent_window']} months · overrides open from {label(overrides.first_open_month())}")
+        else:
+            with st.form("settings"):
+                horizon = st.number_input("Forecast horizon, months", 3, 36, int(cfg["horizon"]))
+                seasonal = st.checkbox("Use seasonal models", bool(cfg["seasonal"]))
+                arima_on = st.checkbox("Use ARIMA and SARIMA models", bool(cfg["arima"]),
+                                       help="Adds ARIMA and SARIMA to the models each series tries. About 1 second "
+                                            "more per series; turn off for very large runs.",
+                                       disabled=not engine.HAS_STATSMODELS)
+                workers = st.number_input("Worker processes for ARIMA (0 = automatic)", 0, 64, int(cfg.get("workers", 0)),
+                                          help=f"Automatic uses {engine.worker_count({'workers': 0})} on this computer. "
+                                               f"Used when there are {engine.PARALLEL_MIN_SERIES}+ series.")
+                holdout = st.number_input("Backtest holdout, months", 3, 12, int(cfg["holdout"]))
+                recent = st.number_input("Recent-mix window, months", 1, 24, int(cfg["recent_window"]))
+                npi_m = st.number_input("New item borrows until it has this many months of its own history", 1, 24,
+                                        int(cfg["npi_own_history_months"]))
+                by_ch = st.checkbox("Pool non-key customers by channel", bool(cfg["nonkey_by_channel"]))
+                drop = st.checkbox("Ignore the latest month (incomplete)", bool(cfg["drop_last_month"]))
+                if st.form_submit_button("Save settings"):
+                    db.set_config({**cfg, "horizon": int(horizon), "seasonal": seasonal, "holdout": int(holdout),
+                                   "recent_window": int(recent), "arima": bool(arima_on), "workers": int(workers), "npi_own_history_months": int(npi_m),
+                                   "nonkey_by_channel": by_ch, "drop_last_month": drop})
+                    st.rerun()
+            with st.form("override_settings"):
+                fz = st.number_input("Planner overrides: months frozen after the current month", 0, 24,
+                                     overrides.rules()["freeze_months"],
+                                     help="Overrides can't be entered or changed before the current month. 0 = open from the "
+                                          "current month; 1 = open from next month, and so on. Does not need a new forecast run.")
+                st.caption(f"Overrides open from {label(overrides.first_open_month(int(fz)))} "
+                           f"(today is {dt.date.today():%d %b %Y}).")
+                if st.form_submit_button("Save override setting"):
+                    overrides.set_rules(int(fz))
+                    st.rerun()
 
 # ------------------------------------------------------------------ masthead (every page)
 _ctx = []
@@ -153,9 +207,11 @@ if info:
     _ctx.append(("Last forecast", info["when"][:16]))
 if demo.is_demo_mode() or db.get_setting("dataset") == "demo-m5":
     _ctx.append(("Data", "Public demo (M5)"))
+if LOCKED:
+    _ctx.append(("Mode", "Hosted demo"))
 st.markdown(style.masthead("Welcome to Demand Predictor", _ctx), unsafe_allow_html=True)
 if demo.is_demo_mode() or db.get_setting("dataset") == "demo-m5":
-    st.caption(demo.NOTE + " See DEMO_DATA.md in the app folder.")
+    st.caption(demo.NOTE + ("" if LOCKED else " See DEMO_DATA.md in the app folder."))
 
 if "flash" in st.session_state:
     st.success(st.session_state.pop("flash"))
@@ -183,7 +239,7 @@ if D["items"].empty and page != "Data":
         st.rerun()
     st.stop()
 
-if res is None and page in ("Forecast", "Lifecycle", "Accuracy"):
+if res is None and page in ("Forecast", "Lifecycle", "Accuracy", "Performance"):
     st.header(page)
     st.info("No forecast yet. Press Run forecast in the sidebar.")
     st.stop()
@@ -193,9 +249,9 @@ DIMS = {"Location": "location", "Customer group": "customer_group", "Account": "
 
 
 @st.cache_data(show_spinner="Splitting the forecast by account...")
-def account_frames(when: str, version: int):
-    """Account-level history, version forecast and unallocated forecast for the last run."""
-    r, inf = db.load_result()
+def account_frames(when: str, version: int, ov_version: int = 0):
+    """Account-level history, version forecast and unallocated forecast for the last run (final forecast)."""
+    r, inf = load_result(when, ov_version)
     d = load_inputs(version)
     nk = bool(inf["config"].get("nonkey_by_channel", False))
     ha = breakdown.account_history(d["shipments"], d["items"], d["customers"], r.hist_months, nk)
@@ -230,6 +286,241 @@ def base_names() -> dict[str, str]:
     it = D["items"]
     name = it["base_description"].fillna("").where(it["base_description"].fillna("") != "", it["description"].fillna(""))
     return dict(zip(it["base_sku"], name))
+
+
+# ------------------------------------------------------------------ planner overrides
+OV_FILL, OV_FILL_LIGHT = "#F1E3C2", "#F8F0DD"   # brass tints: override cell, final forecast that carries one
+LEVEL_COLS = {"base_sku": "Item", "customer_group": "Customer group", "location": "Location"}
+
+
+def view_measures(scope_bases, group, loc) -> pd.DataFrame:
+    m = res.measures
+    m = m[m["base_sku"].isin(scope_bases)]
+    if group != ALL:
+        m = m[m["customer_group"] == group]
+    if loc != ALL:
+        m = m[m["location"] == loc]
+    return m
+
+
+def override_figure(meas: pd.DataFrame):
+    """(label, value, note) for the headline row: overridden cells and units vs stat."""
+    o = meas[meas["override"].notna()]
+    if o.empty:
+        return ("Planner overrides", "None", "the final forecast is the stat forecast")
+    net = float((o["final"] - o["stat"]).sum())
+    stat_all = float(meas["stat"].sum())
+    return ("Planner overrides", f"{fmt(len(o))} cells",
+            f"{net:+,.0f} units vs stat ({net / stat_all * 100:+.1f}% of the horizon)" if stat_all else f"{net:+,.0f} units vs stat")
+
+
+def stat_line(stat_df: pd.DataFrame, x):
+    """Dashed line of the stat forecast, drawn over the final forecast bars."""
+    sl = stat_df.groupby("month", as_index=False)["qty"].sum()
+    sl["label"] = sl["month"].map(label)
+    return alt.Chart(sl).mark_line(color=style.INK, strokeDash=[5, 3], strokeWidth=1.6, point=alt.OverlayMarkDef(
+        size=18, color=style.INK)).encode(x=x, y="qty:Q", tooltip=[alt.Tooltip("label:N", title="Month"),
+                                                                  alt.Tooltip("qty:Q", title="Stat forecast", format=",.0f")])
+
+
+def styled_measures(disp: pd.DataFrame, keycols: list[str], mlabels: list[str], ovm: dict, level: list[str]):
+    """Colour override cells, the final forecast they produce, and the direction of the change."""
+    lab2m = dict(zip(mlabels, res.fc_months))
+
+    def months_for(r):
+        k = tuple(r[LEVEL_COLS[c]] if c in level else None for c in ["base_sku", "customer_group", "location"])
+        return ovm.get(k, set())
+
+    def paint(r):
+        has = months_for(r)
+        out = []
+        for c in disp.columns:
+            css = ""
+            if c in lab2m and lab2m[c] in has:
+                if r["Measure"] == "Planner override":
+                    css = f"background-color:{OV_FILL};font-weight:600"
+                elif r["Measure"] == "Final forecast":
+                    css = f"background-color:{OV_FILL_LIGHT}"
+                elif r["Measure"].startswith("Override vs stat") and pd.notna(r[c]) and r[c] != 0:
+                    css = f"color:{style.GOOD if r[c] > 0 else style.BAD};font-weight:600"
+            out.append(css)
+        return out
+
+    num = mlabels + ["Total"]
+    pct = disp.index[disp["Measure"] == "Override vs stat %"]
+    dif = disp.index[disp["Measure"] == "Override vs stat"]
+    rest = disp.index.difference(pct.union(dif))
+    sty = disp.style.apply(paint, axis=1)
+    sty = sty.format("{:,.0f}", subset=pd.IndexSlice[rest, num], na_rep=" ")
+    sty = sty.format("{:+,.0f}", subset=pd.IndexSlice[dif, num], na_rep=" ")
+    sty = sty.format("{:+.1f}%", subset=pd.IndexSlice[pct, num], na_rep=" ")
+    return sty
+
+
+def override_section(scope_bases: list[str], group, loc, kp: str, default_level: int = 0, find: bool = True):
+    """Measure grid (stat, override, final, override vs stat) with an edit mode for the planner."""
+    first_open = overrides.first_open_month()
+    locked_m = [m for m in res.fc_months if m < first_open]
+    st.subheader("Planner overrides")
+    st.caption((f"Overrides are open from {label(first_open)}; earlier months are locked (set in Settings). "
+                if locked_m else "") + "Type the quantity you want in a Planner override cell. A number typed for a base SKU or customer group "
+               "is spread over the series under it in proportion to their forecast, in whole units. Clear a cell to go "
+               "back to the stat forecast. Overrides are kept when the forecast is run again.")
+    meas = view_measures(scope_bases, group, loc)
+    o1, o2, o3, o4 = st.columns([3, 4, 2, 2])
+    lvl_name = o1.selectbox("Override at", list(overrides.LEVELS), index=default_level, key=kp + "lvl")
+    level = overrides.LEVELS[lvl_name]
+    show = o2.multiselect("Measures", overrides.MEASURES, default=overrides.MEASURES[:4], key=kp + "meas")
+    only = o3.checkbox("Only rows with overrides", key=kp + "only")
+    edit = o4.toggle("Edit overrides", key=kp + "edit")
+    if edit and "Planner override" not in show:
+        show = [m for m in overrides.MEASURES if m in show or m == "Planner override"]
+    if not show:
+        st.info("Pick at least one measure.")
+        return
+    has_ov = set(meas.loc[meas["override"].notna(), "base_sku"])
+    in_meas = set(meas["base_sku"])
+    pool = [b for b in scope_bases if b in in_meas]
+    if only:
+        pool = [b for b in pool if b in has_ov]
+    if find and len(pool) > 1:
+        names_ = base_names()
+        picked = st.multiselect("Items", pool, default=[], key=kp + "find", placeholder="All items in the selection above",
+                                format_func=lambda b: f"{b} · {names_.get(b, '')}")
+        if picked:
+            pool = picked
+    vol = meas[meas["month"].isin(res.fc_months[:12])].groupby("base_sku")["final"].sum()
+    cap = 150
+    if len(pool) > cap:
+        pool = sorted(pool, key=lambda b: -vol.get(b, 0))[:cap]
+        st.caption(f"Showing the {cap} largest items by next-12-month forecast. Pick items, a family or a customer group "
+                   "to see others.")
+    m = meas[meas["base_sku"].isin(pool)]
+    if m.empty:
+        st.info("No forecast rows match this selection." if not only else "No overrides in this selection yet.")
+        return
+    g = overrides.grid(m, level, res.fc_months, show)
+    if only:
+        okeys = m.loc[m["override"].notna(), level].drop_duplicates()
+        g = g.merge(okeys, on=level, how="inner")
+    mlabels = [label(x) for x in res.fc_months]
+    disp = g.rename(columns={**LEVEL_COLS, **dict(zip(res.fc_months, mlabels))})
+    keycols = [LEVEL_COLS[c] for c in level]
+    height = min(36 * (len(disp) + 1) + 3, 620)
+    if not edit:
+        ovm = overrides.overridden_months(m)
+        st.dataframe(styled_measures(disp, keycols, mlabels, ovm, level), hide_index=True, width="stretch", height=height,
+                     column_config={c: st.column_config.TextColumn(pinned=True) for c in keycols + ["Measure"]})
+        st.caption("Shaded: months with a planner override (darker on the override, lighter on the final forecast it "
+                   "gives). Override vs stat is green above the stat forecast and red below.")
+    else:
+        edisp = disp.copy()
+        edisp["Measure"] = edisp["Measure"].replace({"Planner override": "✎ Planner override"})
+        locked_l = [label(x) for x in locked_m]
+        if len(locked_l) == len(mlabels):
+            st.info(f"Every month in this forecast is before {label(first_open)}, so all are locked. Run a new forecast "
+                    "or change the frozen months in Settings.")
+        with st.form(kp + "form"):
+            ed = st.data_editor(edisp, hide_index=True, width="stretch", height=height, key=kp + "editor",
+                                disabled=keycols + ["Measure", "Total"] + locked_l,
+                                column_config={**{c: st.column_config.TextColumn(pinned=True) for c in keycols + ["Measure"]},
+                                               **{ml: st.column_config.NumberColumn(
+                                                   ("🔒 " + ml) if ml in locked_l else ml, format="localized", min_value=0,
+                                                   help=f"Locked: overrides are open from {label(first_open)}"
+                                                   if ml in locked_l else None) for ml in mlabels},
+                                               "Total": st.column_config.NumberColumn(format="localized")})
+            note = st.text_input("Reason for these overrides (optional)", key=kp + "note",
+                                 placeholder="For example: promotion in March, customer order confirmed")
+            saved = st.form_submit_button("Save overrides", type="primary")
+        st.caption("Only the ✎ Planner override rows are saved; changes typed in other rows are ignored."
+                   + (f" 🔒 months (before {label(first_open)}) can't be changed." if locked_m else ""))
+        if saved:
+            edits, ignored = [], 0
+            for i in range(len(edisp)):
+                is_ov = edisp.iloc[i]["Measure"].startswith("✎")
+                for ml, mo in zip(mlabels, res.fc_months):
+                    a, b = edisp.iloc[i][ml], ed.iloc[i][ml]
+                    same = (pd.isna(a) and pd.isna(b)) or (pd.notna(a) and pd.notna(b) and abs(float(a) - float(b)) < 1e-9)
+                    if same:
+                        continue
+                    if not is_ov:
+                        ignored += 1
+                        continue
+                    e = {c: edisp.iloc[i][LEVEL_COLS[c]] for c in level}
+                    e.update(month=mo, value=None if pd.isna(b) else float(b))
+                    edits.append(e)
+            if not edits:
+                st.warning("No Planner override cells were changed." + (f" {ignored} change(s) in other rows were ignored."
+                                                                          if ignored else ""))
+            elif all(e["month"] < first_open for e in edits):
+                st.error(f"Nothing saved: every change was in a locked month. Overrides are open from {label(first_open)}.")
+            else:
+                scope = {"customer_group": None if group == ALL else group, "location": None if loc == ALL else loc}
+                new_ov, problems = overrides.set_cells(overrides.read(), res.measures, res.hist, edits, scope, note.strip(),
+                                                       first_open=first_open)
+                overrides.write(new_ov)
+                save_live_snapshot(res.stat_base_fc, res.fc_months)
+                n_ok = sum(1 for e in edits if e["month"] >= first_open)
+                msg = f"Saved {n_ok} override change(s). The final forecast, versions, accounts and exports now use them."
+                if ignored:
+                    msg += f" {ignored} change(s) outside the Planner override rows were ignored."
+                if problems:
+                    msg += " " + " ".join(problems)
+                st.session_state["flash"] = msg
+                st.session_state[kp + "edit"] = False
+                st.rerun()
+
+    lg = overrides.log(overrides.read(), res.measures, res.fc_months)
+    lg = lg[lg["base_sku"].isin(scope_bases)]
+    if group != ALL:
+        lg = lg[lg["customer_group"] == group]
+    if loc != ALL:
+        lg = lg[lg["location"] == loc]
+    with st.expander(f"Override log ({len(lg):,} cells in this selection)"):
+        if lg.empty:
+            st.write("No overrides yet.")
+        else:
+            st.dataframe(lg.assign(month=lg["month"].map(label)).rename(columns={
+                "base_sku": "Item", "customer_group": "Customer group", "location": "Location", "month": "Month",
+                "stat": "Stat forecast", "override": "Planner override", "diff": "Override vs stat",
+                "diff_pct": "Override vs stat %", "note": "Reason", "saved_at": "Saved", "applied": "In horizon"}),
+                hide_index=True, width="stretch", height=min(36 * (len(lg) + 1) + 3, 360),
+                column_config={"Stat forecast": st.column_config.NumberColumn(format="localized"),
+                               "Planner override": st.column_config.NumberColumn(format="localized"),
+                               "Override vs stat": st.column_config.NumberColumn(format="%+d"),
+                               "Override vs stat %": st.column_config.NumberColumn(format="%+.1f")})
+            l1, l2 = st.columns([2, 3])
+            l1.download_button("Download override log (CSV)", lg.to_csv(index=False).encode(),
+                               file_name="planner_overrides.csv", mime="text/csv", key=kp + "logdl")
+            open_lg = lg[lg["month"] >= first_open]
+            if len(open_lg) and l2.checkbox(f"Remove the {len(open_lg):,} overrides in open months in this selection"
+                                            + (f" ({len(lg) - len(open_lg):,} in locked months stay)" if len(open_lg) < len(lg) else ""),
+                                            key=kp + "clr"):
+                if l2.button("Remove them", type="secondary", key=kp + "clrbtn"):
+                    allov = overrides.read()
+                    k = overrides.KEYS + ["month"]
+                    rm = open_lg[k].assign(_x=1)
+                    keep = allov.merge(rm, on=k, how="left")
+                    overrides.write(keep[keep["_x"].isna()].drop(columns="_x"))
+                    save_live_snapshot(res.stat_base_fc, res.fc_months)
+                    st.session_state["flash"] = f"Removed {len(open_lg):,} overrides. The final forecast is back to stat there."
+                    st.rerun()
+
+
+def grid_highlight(grid: pd.DataFrame, bcol: str, mlabels: list[str], ovm: dict, dims: list[str], acc_group: dict):
+    """Styler shading the month cells of the forecast grid that carry a planner override."""
+    lab2m = dict(zip(mlabels, res.fc_months))
+
+    def paint(r):
+        b = r[bcol]
+        g = r["Customer group"] if "Customer group" in dims else None
+        if "Account" in dims and g is None:
+            g = acc_group.get(str(r["Account"]).split(" · ")[0])
+        l_ = r["Location"] if "Location" in dims else None
+        has = ovm.get((b, g, l_), set())
+        return [f"background-color:{OV_FILL}" if c in lab2m and lab2m[c] in has else "" for c in grid.columns]
+
+    return grid.style.apply(paint, axis=1)
 
 
 # ------------------------------------------------------------------ Forecast
@@ -271,12 +562,15 @@ if page == "Forecast":
         n12 = bfc[bfc["month"].isin(res.fc_months[:12])]["qty"].sum()
         l12 = hist[hist["month"].isin(res.hist_months[-12:])]["qty"].sum()
         act = ser["act"].sum()
+        vmeas = view_measures(in_bases, group, loc)
+        sfc = pick_all(res.stat_base_fc)
         st.markdown(style.kpis([
                 ("Forecast, next 12 months", fmt(n12) + " units",
                  f"{(n12 / l12 - 1) * 100:+.1f}% vs last 12 months shipped ({fmt(l12)})" if l12 else ""),
                 ("Backtest error (WAPE)", f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
                  (f"{level_wape_text(bt_view)} · bias {ser['err'].sum() / act * 100:+.1f}% across {len(ser)} series")
                  if act else ""),
+                override_figure(vmeas),
                 ("Base SKUs", fmt(len(in_bases)), f"{bfc['base_sku'].nunique()} with a forecast"),
                 ("Unallocated", fmt(un["qty"].sum()) + " units",
                  "forecast with no eligible version" if un["qty"].sum() else "every unit reaches a version")]),
@@ -308,9 +602,15 @@ if page == "Forecast":
                      alt.Tooltip("stack:N", title="Family" if by == "family" else "Base SKU"),
                      alt.Tooltip("qty:Q", title="Units", format=",.0f")])
         st.subheader("All base SKUs" + ("" if fam == "All" else f" · {fam}"))
+        any_ov = vmeas["override"].notna().any()
         st.caption("Monthly units, stacked by " + ("family" if by == "family" else "base SKU")
-                   + ". The shaded months are forecast. Hard transitions show under the base SKU live in each month.")
-        st.altair_chart((band + bars).properties(height=320), width="stretch")
+                   + ". The shaded months are forecast (final, after planner overrides)."
+                   + (" The dashed line is the stat forecast before overrides." if any_ov else "")
+                   + " Hard transitions show under the base SKU live in each month.")
+        layers = band + bars + stat_line(sfc, x) if any_ov else band + bars
+        st.altair_chart(layers.properties(height=320), width="stretch")
+
+        override_section(in_bases, group, loc, "all_", default_level=0)
 
         # grid: one row per base SKU, optional version rows
         st.subheader("Forecast by base SKU")
@@ -338,7 +638,7 @@ if page == "Forecast":
             root = ch.loc[b, "root_base"] if b in ch.index else b
             wape = (sm.loc[root, "abs_err"] / sm.loc[root, "act"] * 100) if root in sm.index and sm.loc[root, "act"] else None
             n12b, l12b = float(f.iloc[:12].sum()), float(hist12.get(b, 0))
-            rows.append({"Item": b, "Description": names.get(b, ""), "Family": fam_of.get(b, ""),
+            rows.append({"_b": b, "Item": b, "Description": names.get(b, ""), "Family": fam_of.get(b, ""),
                          "Model": (top_model.get(root, "") if src == "own" else "L" + src[1:]),
                          "WAPE %": wape if src == "own" else None,
                          "Last 12 shipped": l12b, "Next 12 forecast": n12b,
@@ -347,7 +647,7 @@ if page == "Forecast":
                          **{ml: float(v) for ml, v in zip(mlabels, f.values)}, "Total": float(f.sum())})
             if show_versions and b in vwide.index.get_level_values(0):
                 for v, vr in vwide.loc[b].iterrows():
-                    rows.append({"Item": f"    {v}", "Description": "", "Family": "", "Model": "", "WAPE %": None,
+                    rows.append({"_b": b, "Item": f"    {v}", "Description": "", "Family": "", "Model": "", "WAPE %": None,
                                  "Last 12 shipped": float(hist[(hist["base_sku"] == b) & (hist["version_sku"] == v) &
                                                                hist["month"].isin(res.hist_months[-12:])]["qty"].sum()),
                                  "Next 12 forecast": float(vr.iloc[:12].sum()), "Change %": None, "Unallocated": None,
@@ -356,7 +656,7 @@ if page == "Forecast":
             # One row per base SKU (and version) x the chosen dimensions
             dimcols = [DIMS[d] for d in dims]
             if "account" in dimcols:
-                ha_all, va_all, ua_all = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0)
+                ha_all, va_all, ua_all = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0, overrides.version())
                 hsrc, vsrc, usrc, anames = pick_all(ha_all), pick_all(va_all), pick_all(ua_all), account_names()
                 bsrc = pd.concat([vsrc, usrc])
             else:
@@ -387,39 +687,58 @@ if page == "Forecast":
                     rows.append(row)
             grid = pd.DataFrame(rows)
             if len(grid):
-                grid = grid.sort_values(["_b", "_v"] + dims, kind="stable").drop(columns=["_b", "_v"])
+                grid = grid.sort_values(["_b", "_v"] + dims, kind="stable").drop(columns=["_v"])
         grid = pd.DataFrame(rows) if not dims else grid
         if grid.empty:
             st.info("No base SKUs match this selection.")
             st.stop()
         num = st.column_config.NumberColumn(format="localized")
-        st.dataframe(grid, hide_index=True, width="stretch", height=min(38 * (len(grid) + 1) + 3, 640),
-                     column_config={"Item": st.column_config.TextColumn(pinned=True),
+        ovm_all = overrides.overridden_months(vmeas)
+        if "Account" in dims:
+            acc_group = engine.customer_groups(D["customers"], bool(info["config"].get("nonkey_by_channel", False))).to_dict()
+        else:
+            acc_group = {}
+
+        def n_ov(r):
+            g_ = r["Customer group"] if "Customer group" in dims else (acc_group.get(str(r["Account"]).split(" · ")[0])
+                                                                      if "Account" in dims else None)
+            return len(ovm_all.get((r["_b"], g_, r["Location"] if "Location" in dims else None), set()))
+
+        grid.insert(grid.columns.get_loc("Total"), "Overrides", grid.apply(n_ov, axis=1) if len(grid) else 0)
+        if len(grid) * len(mlabels) <= 60000 and ovm_all:
+            shown_grid = grid_highlight(grid, "_b", mlabels, ovm_all, dims, acc_group)
+        else:
+            shown_grid = grid
+        st.dataframe(shown_grid, hide_index=True, width="stretch", height=min(38 * (len(grid) + 1) + 3, 640),
+                     column_config={"_b": None, "Item": st.column_config.TextColumn(pinned=True),
                                     **{d: st.column_config.TextColumn(pinned=True) for d in dims},
                                     "WAPE %": st.column_config.NumberColumn(format="%.1f"),
                                     "Change %": st.column_config.NumberColumn(format="%+.1f"),
                                     "Last 12 shipped": num, "Next 12 forecast": num, "Unallocated": num, "Total": num,
+                                    "Overrides": st.column_config.NumberColumn("Override months", format="%d",
+                                                                               help="Months with a planner override"),
                                     **{ml: num for ml in mlabels}})
         st.caption(("Model and WAPE show without a breakdown. " if dims else
                     "WAPE is the backtest error of the series behind each base SKU; a new product shows the like item it "
                     "borrows from. ") + "Change % compares the next 12 months with the last 12 shipped."
                    + (" Accounts in a customer group share its forecast by their shipments over the last 12 months."
-                      if "Account" in dims else ""))
+                      if "Account" in dims else "")
+                   + " Figures are the final forecast; shaded months carry a planner override.")
         e1, e2, e3 = st.columns([3, 3, 3])
-        e1.download_button("Download this table (CSV)", grid.to_csv(index=False).encode(),
+        e1.download_button("Download this table (CSV)", grid.drop(columns="_b").to_csv(index=False).encode(),
                            file_name=f"forecast_all_base_skus_{info['when'][:10]}.csv", mime="text/csv")
         if e3.button("Prepare forecast by version and account (CSV)"):
-            _, va_all, _ = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0)
+            _, va_all, _ = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0, overrides.version())
             e3.download_button("Download forecast by version and account", va_all.to_csv(index=False).encode(),
                                file_name=f"forecast_by_account_{info['when'][:10]}.csv", mime="text/csv")
-        e2.download_button("Download all forecasts (Excel)", excel_export(info["when"]),
+        e2.download_button("Download all forecasts (Excel)", excel_export(info["when"], overrides.version()),
                            file_name=f"forecast_{info['when'][:10]}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.stop()
     ss = D["split_settings"]
     cur = dict(zip(ss["base_sku"], ss["method"])).get(base, "recent")
     method = c4.selectbox(f"Version split for {base}", list(SPLIT_LABELS), index=list(SPLIT_LABELS).index(cur),
-                          format_func=SPLIT_LABELS.get)
+                          format_func=SPLIT_LABELS.get, disabled=LOCKED)
     if method != cur:
         save("split_settings", pd.concat([ss[ss["base_sku"] != base],
                                           pd.DataFrame([[base, method]], columns=["base_sku", "method"])]))
@@ -436,7 +755,7 @@ if page == "Forecast":
             column_config={"version_sku": "Version", "pct": st.column_config.NumberColumn(
                 "Share of base SKU forecast, %", min_value=0, max_value=100, step=5)})
         st.caption("Shares are rescaled across the versions eligible in each month.")
-        if st.button("Save percentages"):
+        if not LOCKED and st.button("Save percentages"):
             save("manual_split", pd.concat([ms[ms["base_sku"] != base], ed.assign(base_sku=base)]))
 
     ch = res.chains.set_index("base_sku")
@@ -472,6 +791,7 @@ if page == "Forecast":
     def stat(title, value, sub=""):
         figs.append((title, str(value), sub))
 
+    vmeas = view_measures(chain, group, loc)
     stat("Forecast, next 12 months", fmt(n12) + " units",
          f"{(n12 / l12 - 1) * 100:+.0f}% vs last 12 months shipped ({fmt(l12)})" if l12 else "New item, no shipments yet")
     stat("Backtest error (WAPE)" + borrowed, f"{ser['abs_err'].sum() / act * 100:.1f}% WAPE" if act else "n/a",
@@ -486,6 +806,7 @@ if page == "Forecast":
         cal = src_hist.groupby(mm)["qty"].sum() / src_hist.groupby(mm)["month"].nunique()
         stat("Seasonal peak" + borrowed, dt.date(2000, int(cal.idxmax()), 1).strftime("%B"),
              f"{cal.max() / cal.mean():.2f}x an average month")
+    figs.insert(1, override_figure(vmeas))
     st.markdown(style.kpis(figs), unsafe_allow_html=True)
 
     # ---- chart: history and forecast stacked by version
@@ -511,8 +832,11 @@ if page == "Forecast":
         tooltip=[alt.Tooltip("label:N", title="Month"), alt.Tooltip("kind:N", title="Type"),
                  alt.Tooltip("version_sku:N", title="Version"), alt.Tooltip("qty:Q", title="Units", format=",.0f")])
     st.subheader("  →  ".join(f"{b} {names[b]}" for b in sorted(chain, key=lambda b: b == root)))
-    st.caption("Monthly units by version. The shaded months are forecast.")
-    st.altair_chart((band + bars).properties(height=340), width="stretch")
+    any_ov = vmeas["override"].notna().any()
+    st.caption("Monthly units by version. The shaded months are forecast (final, after planner overrides)."
+               + (" The dashed line is the stat forecast before overrides." if any_ov else ""))
+    layers = band + bars + stat_line(pick(res.stat_base_fc), x) if any_ov else band + bars
+    st.altair_chart(layers.properties(height=340), width="stretch")
 
     # ---- lifecycle rules that apply to this chain
     notes = []
@@ -539,6 +863,8 @@ if page == "Forecast":
     if notes:
         st.markdown("**Lifecycle rules in effect**\n" + "\n".join(f"- {n}" for n in notes))
 
+    override_section(chain, group, loc, "one_", default_level=1, find=False)
+
     # ---- grid
     st.subheader("Forecast grid")
     dims = st.multiselect("Break down by", list(DIMS), default=[], placeholder="No breakdown: totals only",
@@ -546,7 +872,7 @@ if page == "Forecast":
                           "Accounts in a group share its forecast by their shipments over the last 12 months.")
     dimcols = [DIMS[d] for d in dims]
     if "account" in dimcols:
-        _, va_all, ua_all = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0)
+        _, va_all, ua_all = account_frames(info["when"], db.get_setting("inputs_version", 0) or 0, overrides.version())
         vsrc, usrc = pick(va_all), pick(ua_all)
         anames = account_names()
     else:
@@ -559,7 +885,7 @@ if page == "Forecast":
         row = {"Item": name}
         for d, c in zip(dims, dimcols):
             row[d] = "All" if dv is None else (anames.get(dv[c], dv[c]) if c == "account" else dv[c])
-        return {**row, **{label(m): int(v) for m, v in s_.items()}, "Total": int(s_.sum())}
+        return {**row, **{label(m): int(round(v)) for m, v in s_.items()}, "Total": int(round(s_.sum()))}
 
     def split_lines(name, df):
         if not dimcols or df.empty:
@@ -569,7 +895,7 @@ if page == "Forecast":
             row = {"Item": name}
             for d, c in zip(dims, dimcols):
                 row[d] = anames.get(r_[c], r_[c]) if c == "account" else r_[c]
-            vals = [int(r_[m]) for m in res.fc_months]
+            vals = [int(round(r_[m])) for m in res.fc_months]
             out.append({**row, **dict(zip(mcols, vals)), "Total": sum(vals)})
         return out
 
@@ -600,7 +926,7 @@ if page == "Forecast":
     e0, e1, e2 = st.columns([3, 3, 3])
     e0.download_button("Download this table (CSV)", grid.to_csv(index=False).encode(),
                        file_name=f"forecast_{base}_{info['when'][:10]}.csv", mime="text/csv")
-    e1.download_button("Download all forecasts (Excel)", excel_export(info["when"]),
+    e1.download_button("Download all forecasts (Excel)", excel_export(info["when"], overrides.version()),
                        file_name=f"forecast_{info['when'][:10]}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     e2.download_button("Download version forecast (CSV)", res.version_fc.to_csv(index=False).encode(),
@@ -890,14 +1216,14 @@ elif page == "Lifecycle":
     st.subheader("Version transitions")
     st.caption("One version replaces another inside a base SKU. Use a customer group name to move that customer first, "
                "and ALL for everyone else. This is how a staggered transition is set up.")
-    vt = st.data_editor(D["version_transitions"], num_rows="dynamic", hide_index=True, key="vt", width="stretch",
+    vt = st.data_editor(D["version_transitions"], num_rows="fixed" if LOCKED else "dynamic", hide_index=True, key="vt", width="stretch", disabled=LOCKED,
                         column_config={"from_version": st.column_config.TextColumn("From version", required=True),
                                        "to_version": st.column_config.TextColumn("To version", required=True),
                                        "customer_group": st.column_config.TextColumn("Customer group or ALL", default=ALL, required=True),
                                        "effective_month": month_col("Effective month")})
     st.subheader("Hard transitions")
     st.caption("A whole base SKU is discontinued and replaced. The successor is forecast on the combined history.")
-    ht = st.data_editor(D["hard_transitions"], num_rows="dynamic", hide_index=True, key="ht", width="stretch",
+    ht = st.data_editor(D["hard_transitions"], num_rows="fixed" if LOCKED else "dynamic", hide_index=True, key="ht", width="stretch", disabled=LOCKED,
                         column_config={"from_base": st.column_config.TextColumn("From base SKU", required=True),
                                        "to_base": st.column_config.TextColumn("To base SKU", required=True),
                                        "effective_month": month_col("Effective month"),
@@ -905,13 +1231,15 @@ elif page == "Lifecycle":
     st.subheader("New products")
     st.caption("A new base SKU borrows the forecast of a like item, times a factor, with an optional ramp for the first months "
                "(for example 0.3,0.6,0.85).")
-    npd = st.data_editor(D["new_products"], num_rows="dynamic", hide_index=True, key="npd", width="stretch",
+    npd = st.data_editor(D["new_products"], num_rows="fixed" if LOCKED else "dynamic", hide_index=True, key="npd", width="stretch", disabled=LOCKED,
                          column_config={"base_sku": st.column_config.TextColumn("New base SKU", required=True),
                                         "like_base": st.column_config.TextColumn("Like item (base SKU)", required=True),
                                         "launch_month": month_col("Launch month"),
                                         "scale": st.column_config.NumberColumn("Volume factor", default=1.0, min_value=0.0, step=0.05),
                                         "ramp": st.column_config.TextColumn("Ramp")})
-    if st.button("Save rules", type="primary"):
+    if LOCKED:
+        st.caption("This demo copy is read-only here: you can look, filter, download and enter planner overrides, but not change data or rules.")
+    elif st.button("Save rules", type="primary"):
         db.write("version_transitions", vt.dropna(subset=["from_version", "to_version", "effective_month"]))
         db.write("hard_transitions", ht.dropna(subset=["from_base", "to_base", "effective_month"]))
         save("new_products", npd.dropna(subset=["base_sku", "like_base", "launch_month"]))
@@ -925,7 +1253,7 @@ elif page == "Master data":
     with t1:
         st.caption("Every version rolls up to its base SKU. Untick Forecastable to stop a version receiving forecast; "
                    "its history still counts toward the base SKU.")
-        ed = st.data_editor(D["items"], num_rows="dynamic", hide_index=True, key="items", width="stretch",
+        ed = st.data_editor(D["items"], num_rows="fixed" if LOCKED else "dynamic", hide_index=True, key="items", width="stretch", disabled=LOCKED,
                             column_config={"version_sku": st.column_config.TextColumn("Version SKU", required=True),
                                            "description": "Description", "base_sku": "Base SKU",
                                            "base_description": "Base description",
@@ -934,7 +1262,7 @@ elif page == "Master data":
                                            "forecastable": st.column_config.CheckboxColumn("Forecastable", default=True),
                                            "launch_month": opt_month("Launch month"),
                                            "discontinue_month": opt_month("Discontinue month")})
-        if st.button("Save items", type="primary"):
+        if not LOCKED and st.button("Save items", type="primary"):
             if ed["version_sku"].duplicated().any():
                 st.error("Version SKU must be unique.")
             else:
@@ -942,21 +1270,21 @@ elif page == "Master data":
     with t2:
         st.caption("Key customers are forecast on their own. Everyone else is forecast together as All other. "
                    "Give two key accounts the same customer group to plan them as one.")
-        ed = st.data_editor(D["customers"], num_rows="dynamic", hide_index=True, key="customers", width="stretch",
+        ed = st.data_editor(D["customers"], num_rows="fixed" if LOCKED else "dynamic", hide_index=True, key="customers", width="stretch", disabled=LOCKED,
                             column_config={"account": st.column_config.TextColumn("Account", required=True),
                                            "name": "Customer", "channel": "Channel",
                                            "key_customer": st.column_config.CheckboxColumn("Key customer", default=False),
                                            "customer_group": "Customer group (optional)"})
-        if st.button("Save customers", type="primary"):
+        if not LOCKED and st.button("Save customers", type="primary"):
             if ed["account"].duplicated().any():
                 st.error("Account must be unique.")
             else:
                 save("customers", ed)
     with t3:
-        ed = st.data_editor(D["locations"], num_rows="dynamic", hide_index=True, key="locations", width="stretch",
+        ed = st.data_editor(D["locations"], num_rows="fixed" if LOCKED else "dynamic", hide_index=True, key="locations", width="stretch", disabled=LOCKED,
                             column_config={"location": st.column_config.TextColumn("Location", required=True),
                                            "name": "Name", "type": "Type", "region": "Region"})
-        if st.button("Save locations", type="primary"):
+        if not LOCKED and st.button("Save locations", type="primary"):
             save("locations", ed)
 
 # ------------------------------------------------------------------ Accuracy
@@ -1028,6 +1356,290 @@ elif page == "Accuracy":
         st.dataframe(mc, hide_index=True)
 
 # ------------------------------------------------------------------ Data
+# ------------------------------------------------------------------ Performance
+elif page == "Performance":
+    st.header("Forecast performance")
+    st.caption("How past forecasts compared with what shipped: accuracy, WAPE and bias by month and by lag "
+               "(how far ahead the forecast was made), and forecast value added (FVA) from the stat engine over a "
+               "naive forecast and from planner overrides over the stat forecast.")
+    fam_map = D["items"].groupby("base_sku")["family"].first().fillna("").to_dict()
+
+    @st.cache_data(show_spinner="Comparing past forecasts with shipments...")
+    def perf_eval(snap_ver: int, when: str, prefer: str):
+        r_, _ = db.load_result()
+        return performance.evaluation(performance.read(), r_.hist, r_.hist_months, prefer)
+
+    snaps_cat = performance.catalogue(performance.read())
+    e_all = perf_eval(performance.version(), info["when"], "live")
+
+    def rebuild_panel(expanded: bool):
+        with st.expander("Forecast cycles stored", expanded=expanded):
+            st.write("Each cycle is the forecast as it stood when it was made. **Live** cycles are saved when you run "
+                     "the forecast and refreshed when overrides are saved. **Rebuilt** cycles re-run the stat engine "
+                     "as of a past month, using only the history before it, so accuracy can be measured before live "
+                     "cycles build up. Rebuilt cycles have no overrides, so their final forecast equals stat.")
+            if len(snaps_cat):
+                st.dataframe(snaps_cat.assign(origin=snaps_cat["origin"].map(label)).rename(columns={
+                    "origin": "First forecast month", "source": "Kind", "series": "Series", "months": "Months",
+                    "units_stat": "Stat units", "units_final": "Final units"}), hide_index=True, width="stretch",
+                    height=min(36 * (len(snaps_cat) + 1) + 3, 300),
+                    column_config={"Stat units": st.column_config.NumberColumn(format="localized"),
+                                   "Final units": st.column_config.NumberColumn(format="localized")})
+            if LOCKED:
+                st.caption("The rebuilt history in this demo copy was prepared in advance: 12 monthly cycles, "
+                           "Jun 2025 to May 2026.")
+                return
+            b1, b2 = st.columns([2, 3])
+            n_back = b1.number_input("Rebuild this many past months", 3, 24, 12, key="perf_n")
+            redo = b1.checkbox("Redo months already rebuilt", False, key="perf_redo",
+                               help="Off: only months without a rebuilt cycle are run, so a repeat takes seconds.")
+            n_workers = engine.worker_count(db.get_config())
+            hm = res.hist_months
+            origins = [engine.idx_to_month(engine.month_to_idx(hm[-1]) - k) for k in range(int(n_back) - 1, -1, -1)]
+            have = performance.stored_origins()
+            todo_n = len(origins) if redo else sum(o not in have for o in origins)
+            b2.caption(f"Re-runs the stat engine once per month (ARIMA off), {min(n_workers, max(todo_n, 1))} months at a "
+                       f"time on this computer. {todo_n} of {len(origins)} months to run"
+                       + ("" if redo else "; months already rebuilt are skipped") + ". Live cycles are kept.")
+            if b2.button("Rebuild accuracy history", type="primary", disabled=todo_n == 0):
+                bar = st.progress(0.0, text=f"Rebuilding {todo_n} past forecasts...")
+                cfg_r = {**db.get_config(), "arima": False}
+                t0 = time.time()
+
+                def tick(p, o, n, total):
+                    left = (time.time() - t0) / n * (total - n)
+                    bar.progress(min(1.0, p), text=f"Rebuilt {n} of {total} (latest {label(o)})"
+                                 + (f", about {left / 60:.0f} min left" if left >= 90 else
+                                    f", about {left:.0f} s left" if n < total else ""))
+
+                done = performance.rebuild(inputs(), cfg_r, origins, run_forecast, progress=tick,
+                                           skip_existing=not redo, workers=n_workers)
+                bar.empty()
+                st.session_state["flash"] = (f"Rebuilt {len(done)} past forecast cycles in "
+                                             f"{(time.time() - t0) / 60:.1f} minutes.")
+                st.rerun()
+
+    if e_all.empty:
+        st.info("No past forecast can be measured yet: a forecast only counts once the months it covers have "
+                "shipments. Rebuild accuracy history below to measure the stat engine on past months now; live "
+                "cycles start counting as new shipment months are loaded.")
+        rebuild_panel(True)
+        st.stop()
+
+    # ---- controls
+    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    lvl_name = c1.selectbox("Measure at", list(performance.LEVELS), index=2, key="perf_lvl",
+                            help="Forecasts and actuals are added up to this level for each month before errors are "
+                                 "taken, so errors in the pieces can cancel at higher levels.")
+    level = performance.LEVELS[lvl_name]
+    max_lag = int(e_all["lag"].max())
+    lag_opts = {f"Lag {k}": [k] for k in range(1, max_lag + 1)}
+    lag_opts = {"Lag 1 (one month ahead)": [1], **{k: v for k, v in lag_opts.items() if v != [1]},
+                **({"Lags 1 to 3": [1, 2, 3]} if max_lag >= 3 else {}), "All lags": list(range(1, max_lag + 1))}
+    lag_name = c2.selectbox("Lag", list(lag_opts), key="perf_lag",
+                            help="Lag 1 = the forecast for a month made in the month before it; lag 3 = made three "
+                                 "months ahead, which matters for long lead times.")
+    lags = lag_opts[lag_name]
+    groups_p = sorted(e_all["customer_group"].unique(), key=lambda g: (g.startswith("All other"), g))
+    grp_p = c3.selectbox("Customer group", ["All"] + groups_p, key="perf_grp",
+                         format_func=lambda g: "All customers" if g == "All" else g)
+    fams_p = sorted({f for f in fam_map.values() if f})
+    fam_p = c4.selectbox("Family", ["All"] + fams_p, key="perf_fam", format_func=lambda f: "All families" if f == "All" else f)
+    e = e_all
+    if grp_p != "All":
+        e = e[e["customer_group"] == grp_p]
+    if fam_p != "All":
+        e = e[e["base_sku"].map(fam_map) == fam_p]
+    months_m = sorted(e["month"].unique())
+    if len(months_m) > 1:
+        m_from, m_to = st.select_slider("Measured months", options=months_m, value=(months_m[max(0, len(months_m) - 12)],
+                                        months_m[-1]), format_func=label, key="perf_months")
+        e = e[(e["month"] >= m_from) & (e["month"] <= m_to)]
+    el = e[e["lag"].isin(lags)]
+    if el.empty:
+        st.info("No measured forecasts for this selection.")
+        rebuild_panel(False)
+        st.stop()
+
+    tol = 0.2
+    tot = performance.scores(performance.rollup(el, level, ["month", "origin"], fam_map), tol)
+    has_ov = (el["final"] != el["stat"]).any()
+
+    def pct(v, signed=False):
+        return "n/a" if v != v else (f"{v * 100:+.1f}%" if signed else f"{v * 100:.1f}%")
+
+    def pts(v):
+        return "n/a" if v != v else f"{v * 100:+.1f} pts"
+
+    st.markdown(style.kpis([
+        ("Forecast accuracy (final)", pct(tot["final_acc"]),
+         f"stat {pct(tot['stat_acc'])} · naive {pct(tot['naive_acc'])}"),
+        ("WAPE (final)", pct(tot["final_wape"]), f"{fmt(tot['actual'])} units shipped in the months measured"),
+        ("Bias (final)", pct(tot["final_bias"], True),
+         "over-forecast" if tot["final_bias"] > 0 else "under-forecast" if tot["final_bias"] < 0 else "on target"),
+        ("FVA: stat over naive", pts(tot["fva_stat"]), "what the stat engine adds"),
+        ("FVA: overrides over stat", pts(tot["fva_final"]) if has_ov else "No overrides",
+         "what planner overrides add" if has_ov else "no overrides in the months measured yet"),
+    ]), unsafe_allow_html=True)
+
+    step_colors = {"Naive": NEUTRAL, "Stat forecast": SERIES[2], "Final forecast": style.SPRUCE}
+    lab = "timeFormat(datetime(parseInt(slice(datum.value,0,4)), parseInt(slice(datum.value,5,7))-1, 1), '%b %y')"
+
+    # ---- accuracy by month with 3-month rolling
+    bm = performance.by(el, level, ["month"], fam_map, tol)
+    ro = performance.rolling(el, level, 3, families=fam_map)
+    long = pd.concat([bm.assign(kind="Monthly")[["month", "kind", "naive_acc", "stat_acc", "final_acc"]],
+                      ro.assign(kind="3-month rolling")[["month", "kind", "naive_acc", "stat_acc", "final_acc"]]
+                      if len(ro) else pd.DataFrame()])
+    long = long.melt(id_vars=["month", "kind"], var_name="step", value_name="acc")
+    long["step"] = long["step"].str.replace("_acc", "").map(performance.STEP_NAMES)
+    if not has_ov:
+        long = long[long["step"] != "Final forecast"]
+    long["label"] = long["month"].map(label)
+    xm = alt.X("month:N", sort=months_m, title=None, axis=alt.Axis(labelExpr=lab, labelAngle=0))
+    shown_steps = [s_ for s_ in step_colors if s_ in set(long["step"])]
+    chart_m = alt.Chart(long).mark_line(point=alt.OverlayMarkDef(size=28)).encode(
+        x=xm, y=alt.Y("acc:Q", title="Forecast accuracy", axis=alt.Axis(format="%"), scale=alt.Scale(zero=False)),
+        color=alt.Color("step:N", title=None, scale=alt.Scale(domain=shown_steps, range=[step_colors[k] for k in shown_steps]),
+                        legend=alt.Legend(orient="top")),
+        strokeDash=alt.StrokeDash("kind:N", title=None, scale=alt.Scale(domain=["Monthly", "3-month rolling"],
+                                                                        range=[[1, 0], [5, 3]]), legend=alt.Legend(orient="top")),
+        detail="kind:N",
+        tooltip=[alt.Tooltip("label:N", title="Month"), alt.Tooltip("step:N", title="Forecast"),
+                 alt.Tooltip("kind:N", title="Measure"), alt.Tooltip("acc:Q", title="Accuracy", format=".1%")])
+    st.subheader("Accuracy by month")
+    st.caption(f"{lag_name}, measured at {lvl_name.replace("Base SKU", "base SKU").replace("Customer group", "customer group").replace("Family", "family").replace("Total", "total")}. Solid lines are each month on its own; dashed lines are the "
+               "3-month rolling accuracy (the month and the two before it together)."
+               + ("" if has_ov else " The final forecast equals stat in these months, so only stat is drawn."))
+    st.altair_chart(chart_m.properties(height=280), width="stretch")
+
+    # ---- accuracy by lag + bias by month
+    a1, a2 = st.columns(2)
+    e_lags = e  # all lags, same filters and months
+    bl = performance.by(e_lags, level, ["lag"], fam_map, tol)
+    bll = bl.melt(id_vars=["lag"], value_vars=[f"{x}_acc" for x in performance.STEPS], var_name="step", value_name="acc")
+    bll["step"] = bll["step"].str.replace("_acc", "").map(performance.STEP_NAMES)
+    if not has_ov:
+        bll = bll[bll["step"] != "Final forecast"]
+    a1.markdown("**Accuracy by lag**")
+    a1.altair_chart(alt.Chart(bll).mark_line(point=alt.OverlayMarkDef(size=30)).encode(
+        x=alt.X("lag:O", title="Months ahead the forecast was made (lag)", axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("acc:Q", title="Forecast accuracy", axis=alt.Axis(format="%"), scale=alt.Scale(zero=False)),
+        color=alt.Color("step:N", title=None, scale=alt.Scale(domain=shown_steps, range=[step_colors[k] for k in shown_steps]),
+                        legend=alt.Legend(orient="top")),
+        tooltip=[alt.Tooltip("lag:O", title="Lag"), alt.Tooltip("step:N", title="Forecast"),
+                 alt.Tooltip("acc:Q", title="Accuracy", format=".1%")]).properties(height=240), width="stretch")
+    a1.caption("All lags in the measured months. Accuracy usually falls the further ahead a forecast is made; the gap "
+               "between stat and naive is what the engine adds at each lead time.")
+    bb = bm[["month", "final_bias"]].assign(label=lambda d: d["month"].map(label),
+                                            dir=lambda d: np.where(d["final_bias"] >= 0, "Over-forecast", "Under-forecast"))
+    a2.markdown("**Bias by month**")
+    a2.altair_chart(alt.Chart(bb).mark_bar(cornerRadiusEnd=2).encode(
+        x=alt.X("month:N", sort=months_m, title=None, axis=alt.Axis(labelExpr=lab, labelAngle=0)),
+        y=alt.Y("final_bias:Q", title="Bias (forecast vs actual)", axis=alt.Axis(format="%")),
+        color=alt.Color("dir:N", title=None, scale=alt.Scale(domain=["Over-forecast", "Under-forecast"],
+                                                             range=[SERIES[1], SERIES[2]]), legend=alt.Legend(orient="top")),
+        tooltip=[alt.Tooltip("label:N", title="Month"), alt.Tooltip("final_bias:Q", title="Bias", format="+.1%")]
+    ).properties(height=240), width="stretch")
+    a2.caption(f"{lag_name}. A run of bars on one side means the forecast is consistently high or low.")
+
+    # ---- rolling accuracy by lag (lead-time view)
+    rl = performance.rolling(e_lags, level, 3, by_lag=True, families=fam_map)
+    if len(rl):
+        st.subheader("3-month rolling accuracy by lag")
+        st.caption("Each cell is the final forecast's accuracy over the month and the two before it, for forecasts made "
+                   "that many months ahead. Read across a row to see a lead time improving or slipping; read down a "
+                   "column to see how accuracy falls with lead time.")
+        rl = rl[rl["lag"] <= min(max_lag, 6)]
+        rl["label"] = rl["month"].map(label)
+        hm_ = alt.Chart(rl).mark_rect(stroke="white", strokeWidth=1).encode(
+            x=alt.X("month:N", sort=months_m, title=None, axis=alt.Axis(labelExpr=lab, labelAngle=0)),
+            y=alt.Y("lag:O", title="Lag"),
+            color=alt.Color("final_acc:Q", title="Accuracy", scale=alt.Scale(scheme="greens"), legend=alt.Legend(format="%")),
+            tooltip=[alt.Tooltip("label:N", title="Month"), alt.Tooltip("lag:O", title="Lag"),
+                     alt.Tooltip("final_acc:Q", title="Final accuracy", format=".1%"),
+                     alt.Tooltip("stat_acc:Q", title="Stat accuracy", format=".1%"),
+                     alt.Tooltip("naive_acc:Q", title="Naive accuracy", format=".1%")])
+        txt = alt.Chart(rl).mark_text(fontSize=11).encode(
+            x=alt.X("month:N", sort=months_m), y="lag:O", text=alt.Text("final_acc:Q", format=".0%"),
+            color=alt.condition("datum.final_acc > 0.75", alt.value("white"), alt.value(style.INK)))
+        st.altair_chart((hm_ + txt).properties(height=34 * rl["lag"].nunique() + 30), width="stretch")
+
+    # ---- FVA summary
+    st.subheader("Forecast value added")
+    fv = pd.DataFrame([{"Step": performance.STEP_NAMES[s_], "Accuracy %": tot[f"{s_}_acc"] * 100,
+                        "WAPE %": tot[f"{s_}_wape"] * 100, "Bias %": tot[f"{s_}_bias"] * 100,
+                        "Hit rate %": tot[f"{s_}_hit"] * 100, "MAD (units)": tot[f"{s_}_mad"],
+                        "FVA vs step before (pts)": (None if s_ == "naive" else
+                                                     (tot["fva_stat"] if s_ == "stat" else tot["fva_final"]) * 100)}
+                       for s_ in performance.STEPS])
+    st.dataframe(fv, hide_index=True, width="stretch",
+                 column_config={"Accuracy %": st.column_config.NumberColumn(format="%.1f"),
+                                "WAPE %": st.column_config.NumberColumn(format="%.1f"),
+                                "Bias %": st.column_config.NumberColumn(format="%+.1f"),
+                                "Hit rate %": st.column_config.NumberColumn(format="%.1f"),
+                                "MAD (units)": st.column_config.NumberColumn(format="%.0f"),
+                                "FVA vs step before (pts)": st.column_config.NumberColumn(format="%+.1f")})
+    st.caption(f"{lag_name}, {lvl_name.replace("Base SKU", "base SKU").replace("Customer group", "customer group").replace("Family", "family").replace("Total", "total")}. Positive FVA means the step made the forecast more accurate; negative "
+               "means it made it worse. Naive = the same month last year, or the last month's actual when last year "
+               "is not known at the time." + ("" if has_ov else " Overrides start counting once months that had "
+                                              "overrides have shipped."))
+
+    # ---- items
+    if level:
+        st.subheader("Where the error comes from")
+        it_ = performance.items(el, level, fam_map)
+        names_p = base_names()
+        show_it = it_.copy()
+        if "base_sku" in show_it:
+            show_it.insert(1, "description", show_it["base_sku"].map(names_p))
+        for c_ in ["final_acc", "stat_acc", "naive_acc", "bias", "fva_stat", "fva_final"]:
+            show_it[c_] = show_it[c_] * 100
+        show_it["flag"] = np.where(show_it["tracking_signal"].abs() > 4,
+                                   np.where(show_it["tracking_signal"] > 0, "Biased high", "Biased low"), "")
+        cols_it = level + (["description"] if "base_sku" in show_it else []) + [
+            "actual", "final", "final_acc", "stat_acc", "naive_acc", "bias", "fva_stat", "fva_final",
+            "tracking_signal", "flag", "error_share", "months"]
+        st.dataframe(show_it[cols_it].head(300), hide_index=True, width="stretch", height=420,
+                     column_config={
+                         "base_sku": st.column_config.TextColumn("Item", pinned=True), "description": "Description",
+                         "customer_group": "Customer group", "location": "Location", "family": "Family",
+                         "actual": st.column_config.NumberColumn("Shipped", format="localized"),
+                         "final": st.column_config.NumberColumn("Final forecast", format="localized"),
+                         "final_acc": st.column_config.NumberColumn("Accuracy % (final)", format="%.1f"),
+                         "stat_acc": st.column_config.NumberColumn("Accuracy % (stat)", format="%.1f"),
+                         "naive_acc": st.column_config.NumberColumn("Accuracy % (naive)", format="%.1f"),
+                         "bias": st.column_config.NumberColumn("Bias %", format="%+.1f"),
+                         "fva_stat": st.column_config.NumberColumn("FVA stat vs naive (pts)", format="%+.1f"),
+                         "fva_final": st.column_config.NumberColumn("FVA overrides (pts)", format="%+.1f"),
+                         "tracking_signal": st.column_config.NumberColumn("Tracking signal", format="%+.1f",
+                                                                          help="Total error / mean absolute error. Beyond ±4 the forecast is persistently high or low."),
+                         "flag": "Bias flag",
+                         "error_share": st.column_config.ProgressColumn("Share of total error", format="percent",
+                                                                        min_value=0, max_value=float(max(show_it["error_share"].max(), 0.01))),
+                         "months": st.column_config.NumberColumn("Months", format="%d")})
+        st.caption(f"Sorted by absolute error, largest first ({len(it_):,} rows; the first 300 shown). The top rows are "
+                   "where better forecasts or overrides would pay off most. FVA columns are in percentage points.")
+        st.download_button("Download this table (CSV)", show_it[cols_it].to_csv(index=False).encode(),
+                           file_name="forecast_performance.csv", mime="text/csv")
+
+    with st.expander("How these are measured"):
+        st.markdown(
+            "- **Forecast accuracy** = 1 − WAPE, floored at 0.\n"
+            "- **WAPE** = total absolute error ÷ total shipped. **Bias** = total error ÷ total shipped; positive means "
+            "over-forecast.\n"
+            "- Forecasts and actuals are first added up to the level you pick, month by month, then compared.\n"
+            "- **Lag** = how many months ahead the forecast was made. Lag 1 is the first month of a forecast cycle.\n"
+            "- **3-month rolling accuracy** pools the month with the two before it.\n"
+            "- **FVA** = accuracy of a step minus accuracy of the step before it, in percentage points: stat over naive "
+            "shows what the engine adds; final over stat shows what planner overrides add.\n"
+            "- **Naive** = the same month last year when it was known at the time, else the last month's actual.\n"
+            f"- **Hit rate** = share of item-months within ±{tol:.0%} of what shipped.\n"
+            "- **MAD** = mean absolute error per item-month, in units. **Tracking signal** = total error ÷ MAD for an "
+            "item; beyond ±4 flags persistent bias.\n"
+            "- A series with no shipment in a measured month counts as 0 shipped.")
+    rebuild_panel(False)
+
 elif page == "Data":
     st.header("Data")
     c = st.columns(4)
@@ -1049,17 +1661,26 @@ elif page == "Data":
         else:
             db.write(table, clean)
 
-    st.subheader("Load everything from one workbook")
-    st.write("One Excel file with a sheet per table: items, customers, locations, shipments, version transitions, "
-             "hard transitions, new products, split methods and manual split percentages. Sheets you leave out are not changed.")
+    if LOCKED:
+        st.subheader("Templates and downloads")
+        st.write("The templates a client would fill in to load their own data, and everything loaded in this demo, as one "
+                 "workbook. Loading data is switched off in this hosted copy.")
+    else:
+        st.subheader("Load everything from one workbook")
+        st.write("One Excel file with a sheet per table: items, customers, locations, shipments, version transitions, "
+                 "hard transitions, new products, split methods and manual split percentages. Sheets you leave out are not changed.")
     w1, w2, _ = st.columns([2, 2, 3])
     w1.download_button("Download blank template", dataio.template_workbook(), file_name="demand_planner_template.xlsx",
                        mime=XLSX, key="tpl_book")
     if not D["items"].empty:
-        w2.download_button("Download what is loaded now", dataio.current_data_workbook(D),
-                           file_name=f"demand_planner_data_{dt.date.today():%Y-%m-%d}.xlsx", mime=XLSX, key="cur_book",
-                           help="Edit it in Excel and load it back here.")
-    book = st.file_uploader("Workbook", type=["xlsx", "xlsm"], key="up_book")
+        if w2.button("Prepare what is loaded now (Excel)", key="prep_book",
+                     help="Builds one workbook of every table loaded; about half a minute for large data."):
+            st.session_state["book_ready"] = True
+        if st.session_state.get("book_ready"):
+            w2.download_button("Download what is loaded now", current_workbook(db.get_setting("inputs_version", 0) or 0),
+                               file_name=f"demand_planner_data_{dt.date.today():%Y-%m-%d}.xlsx", mime=XLSX, key="cur_book",
+                               help="Edit it in Excel and load it back here.")
+    book = None if LOCKED else st.file_uploader("Workbook", type=["xlsx", "xlsm"], key="up_book")
     if book is not None:
         try:
             raw, other = dataio.read_workbook(book)
@@ -1105,7 +1726,7 @@ elif page == "Data":
         elif not other:
             st.error("No recognised sheets. Use the sheet names from the template.")
 
-    st.subheader("Load one table at a time")
+    st.subheader("Templates for each table" if LOCKED else "Load one table at a time")
     st.write("CSV or Excel, first row as headers. Load the masters before shipments and rules. "
              "Daily shipment lines are summed to months. Common header names are recognised.")
     for tab, (table, title, sheet, req, opt) in zip(st.tabs([s[1] for s in dataio.SPECS]), dataio.SPECS):
@@ -1119,7 +1740,7 @@ elif page == "Data":
                                 key="ship_mode")
             elif table in dataio.RULE_KEYS:
                 st.caption("Loading replaces every row of this table.")
-            up = st.file_uploader(f"{title} file", type=["csv", "xlsx", "xls", "txt"], key=f"up_{table}")
+            up = None if LOCKED else st.file_uploader(f"{title} file", type=["csv", "xlsx", "xls", "txt"], key=f"up_{table}")
             if up is not None:
                 try:
                     clean, issues = dataio.normalize(table, dataio.read_upload(up))
@@ -1150,6 +1771,10 @@ elif page == "Data":
                                         "Horizon": r["config"]["horizon"], "Seasonal": r["config"]["seasonal"]}
                                        for r in reversed(log)]), hide_index=True)
 
+    if LOCKED:
+        st.info("This is a hosted demo copy: uploading, replacing and clearing data are switched off. The templates "
+                "and the data loaded now can still be downloaded above.")
+        st.stop()
     st.subheader("Sample data and reset")
     if demo.available():
         st.write("Replace everything with the demo dataset: M5 Walmart food and household products (1,000 products, "

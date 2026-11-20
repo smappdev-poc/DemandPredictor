@@ -1,6 +1,9 @@
-streamlit>=1.55,<2
-pandas>=2.2
-numpy>=1.26
-altair>=5.3
-openpyxl>=3.1
-statsmodels>=0.14.5
+# Exact versions tested on the laptop (Python 3.14) and in the hosted demo (Python 3.13).
+streamlit==1.65.0
+pandas==3.0.6
+numpy==2.5.4
+altair==6.3.0
+openpyxl==3.1.5
+statsmodels==0.15.0
+scipy==1.18.1
+pyarrow==25.0.1
